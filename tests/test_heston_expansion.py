@@ -14,7 +14,7 @@ from scipy.special import gamma
 
 from roughprix import fourier
 from roughprix.heston import rough_heston
-from roughprix.heston.expansion_base import _heuristic_measure_L, _heuristic_measure_panels
+from roughprix.heston.base_solution import _heuristic_measure_L, _heuristic_measure_panels
 from roughprix.heston.rough_heston import (
     RoughHeston,
     HestonExpansionState,
