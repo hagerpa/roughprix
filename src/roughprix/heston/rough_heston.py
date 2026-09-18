@@ -16,19 +16,23 @@ class RoughHestonParam:
     The variance process satisfies
 
         dS_t = sqrt(V_t) S_t dW_t
-        V_t  = V0 + (1/Γ(H+½)) ∫₀ᵗ (t-s)^(H-½) [lam*(theta - V_s) ds
+        V_t  = V0 + (1/Γ(H+½)) ∫₀ᵗ (t-s)^(H-½) [(theta - lam*V_s) ds
                                                     + nu*sqrt(V_s) dB_s]
         corr(dW_t, dB_t) = rho
 
     where H ∈ (-½, ½] is the Hurst exponent; H = ½ recovers classical Heston.
-    All parameters are the *raw* (un-normalised) Riccati coefficients.
+    All parameters are the *raw* (un-normalised) Riccati coefficients, so the
+    drift constant is theta itself and not lam*theta: in the usual Heston
+    parameterisation dV = kappa(vbar - V)dt, set lam = kappa and
+    theta = kappa*vbar.
 
     Parameters
     ----------
     lam : float
         Mean-reversion speed of the variance process.
     theta : float
-        Long-run variance level (mean of V_t as t → ∞).
+        Raw drift constant. The long-run variance is theta/lam, which the
+        defaults below make equal to V0.
     nu : float
         Vol-of-vol (raw, un-normalised).
     rho : float
