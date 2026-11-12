@@ -19,8 +19,10 @@ The Adams and implicit-$\pi$ solvers are selected automatically via `direct_ricc
 ## Installation
 
 ```bash
-pip install -e .
+pip install roughprix
 ```
+
+or, from a clone of the repository, `pip install -e .`.
 
 Requires Python ≥ 3.10, NumPy, SciPy, JAX, and Numba.
 

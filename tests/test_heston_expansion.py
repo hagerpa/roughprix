@@ -1673,9 +1673,9 @@ def test_adams_no_r_heston_fourier_import():
     """base='direct_riccati' must not import from r_heston_fourier."""
     import inspect
     from roughprix.heston import rough_heston
-    src = inspect.getsource(heston_expansion)
+    src = inspect.getsource(rough_heston)
     assert "r_heston_fourier" not in src, \
-        "heston_expansion.py still references r_heston_fourier"
+        "rough_heston.py still references r_heston_fourier"
 
 
 def test_adams_benchmark_vs_root_pade_small_contour():
