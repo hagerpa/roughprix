@@ -18,10 +18,16 @@ where
     b_raw = -nu * lamTilde
     q_raw = 0.5 * nu^2
 
+At a = 0 and a = -i the constant c_raw vanishes and h = 0 is the exact
+solution.  The Padé coefficients are 0/0 there, so every approximant in this
+module returns h = 0 at those nodes directly.
 
 Supported Padé orders: "22", "33", "44".
 """
 from __future__ import annotations
+
+import functools
+import inspect
 
 import numpy as np
 from scipy.special import gamma as _gamma, rgamma as _rgamma
@@ -43,6 +49,33 @@ def _pade_common(a, H, rho, nu, lam):
     return al, lamTilde, aa, rm, c, b, q
 
 
+def _zero_where_c_vanishes(fn):
+    """Return h = 0 at the nodes where c = -a(a+i)/2 vanishes, i.e. a = 0 and a = -i.
+
+    F(0) = c = 0 there, so h = 0 solves the Riccati equation exactly, but the
+    Padé coefficients are 0/0.  ``fn`` is called on the other nodes only; its
+    first parameter must be the CF argument.
+    """
+    sig = inspect.signature(fn)
+    a_name = next(iter(sig.parameters))
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        a = np.asarray(bound.arguments[a_name], dtype=np.complex128).reshape(-1)
+        regular = a * (a + 1j) != 0
+        if regular.all():
+            return fn(*args, **kwargs)
+        bound.arguments[a_name] = a[regular]
+        h_regular = fn(*bound.args, **bound.kwargs)
+        h = np.zeros((a.size, h_regular.shape[-1]), dtype=np.complex128)
+        h[regular] = h_regular
+        return h
+
+    return wrapper
+
+
+@_zero_where_c_vanishes
 def h_pade22(
     a: np.ndarray,
     tau: np.ndarray,
@@ -104,6 +137,7 @@ Returns
     return h  # (N_a, N_tau)
 
 
+@_zero_where_c_vanishes
 def h_pade33(
     a: np.ndarray,
     tau: np.ndarray,
@@ -219,6 +253,7 @@ Returns
     return h  # (N_a, N_tau)
 
 
+@_zero_where_c_vanishes
 def h_pade44(
     a: np.ndarray,
     tau: np.ndarray,
@@ -229,6 +264,9 @@ def h_pade44(
     lam: float,
 ) -> np.ndarray:
     """Gatheral Padé 4/4 approximation of the rough Heston Riccati solution.
+
+    At H = 0 the long-time coefficient g3 has a pole; there the limit H -> 0 is
+    returned.
 
     Parameters
     ----------
@@ -262,34 +300,40 @@ Returns
 
     # ---- long-time asymptotic: g0..g3 ----
     # h ~ g0 + g1/y + g2/y^2 + g3/y^3  as y=tau^al -> inf
-    # Derived from linearised D^al v = -lin*v near g0 using Mittag-Leffler asymptotics.
+    # Nonlinear terms from Gatheral's R formula (h.Pade44).  g3 carries a factor
+    # Gamma(1 - 2al), which has a pole at H = 0, so we keep g3r2 = g3 * r2 with
+    # r2 = 1/Gamma(1 - 2al) and scale the row that holds g3 by r2 below.
     g0 = rm / nu
     lin = aa * nu
+    r2 = _rgamma(1.0 - 2.0 * al)
     g1 = -g0 / lin * _rgamma(1.0 - al)
-    g2 = g0 / lin ** 2 * _rgamma(1.0 - 2.0 * al)
-    g3 = -g0 / lin ** 3 * _rgamma(1.0 - 3.0 * al)
+    g2 = g0 / lin ** 2 * r2 + q / lin * g1 ** 2
+    g3r2 = -(_rgamma(1.0 - 3.0 * al) * g2 - 2.0 * q * g1 * g2 * r2) / lin
 
     if abs(al - 1.0) < 1e-15:
         g1 = np.zeros_like(g0)
         g2 = np.zeros_like(g0)
-        g3 = np.zeros_like(g0)
+        g3r2 = np.zeros_like(g0)
+        r2 = 1.0
 
     # ---- solve 4x4 system for denominator coefficients q1..q4 ----
     # Matching short-time (4 Taylor terms) and long-time (4 asymptotic terms):
     #   Row 0: [-b2, -b1,  g0,  g1] * [q1;q2;q3;q4] = b3
     #   Row 1: [-b1,  g0,  g1,  g2]                  = b2
-    #   Row 2: [ g0,  g1,  g2,  g3]                  = b1
+    #   Row 2: [ g0,  g1,  g2,  g3] * r2             = b1 * r2
     #   Row 3: [ b3,  b2,  b1, -g0]                  = -b4
+    # The factor r2 leaves the solution unchanged for H != 0; at H = 0 row 2
+    # becomes q4 = 0, the limit of the approximant as H -> 0.
     N = len(a)
     A = np.empty((N, 4, 4), dtype=np.complex128)
     A[:, 0, :] = np.column_stack([-b2, -b1, g0, g1])
     A[:, 1, :] = np.column_stack([-b1, g0, g1, g2])
-    A[:, 2, :] = np.column_stack([g0, g1, g2, g3])
+    A[:, 2, :] = np.column_stack([g0 * r2, g1 * r2, g2 * r2, g3r2])
     A[:, 3, :] = np.column_stack([b3, b2, b1, -g0])
 
     # rhs shape (N, 4, 1): explicit 3rd dim prevents numpy from treating (N,4)
     # as a multi-RHS problem rather than a batched single-RHS problem.
-    rhs = np.stack([b3, b2, b1, -b4], axis=-1)[:, :, None]  # (N, 4, 1)
+    rhs = np.stack([b3, b2, b1 * r2, -b4], axis=-1)[:, :, None]  # (N, 4, 1)
 
     q_sol = np.linalg.solve(A, rhs).squeeze(-1)  # (N, 4)
     q1, q2, q3, q4 = q_sol[:, 0], q_sol[:, 1], q_sol[:, 2], q_sol[:, 3]
@@ -314,15 +358,15 @@ Returns
     return h  # (N_a, N_tau)
 
 
+@_zero_where_c_vanishes
 def rough_heston_root_pade_f0(
         u: np.ndarray,
         t: np.ndarray,
         param,
         *,
-        degree: int = 7,
+        degree: int = 9,
         H: float = 0.0,
-        tail_match: bool = True,
-        tail_match_alpha_tol: float = 1e-10) -> np.ndarray:
+        tail_match: bool = True) -> np.ndarray:
     """Root-transformed Padé approximation of the rough Heston Riccati base solution.
 
     Matches exact short-time Riccati coefficients in the large-u-aware variable
@@ -339,11 +383,11 @@ def rough_heston_root_pade_f0(
     param        : model parameters (.lam, .nu, .rho)
     degree       : Padé numerator degree; denominator degree = degree+1
     H             : Hurst exponent anchor; alpha = H_anchor + 0.5 must be in (0, 1]
-    tail_match           : if True and alpha < 1 - tail_match_alpha_tol, replace the
-                           highest short-time Padé equation with the leading 1/x tail
-                           constraint p_m = C_exact * q_n, where
+    tail_match           : if True, replace the highest short-time Padé equation with the
+                           leading 1/x tail constraint p_m = C_exact * q_n, where
                            C_exact = r_plus / (r_plus - r_minus) / Gamma(1 - alpha).
-    tail_match_alpha_tol : suppress tail match when alpha >= 1 - tail_match_alpha_tol.
+                           At alpha = 1 C_exact = 0: E decays exponentially there, and
+                           a free 1/x tail would make the log-CF integral grow like log u.
 
     Returns
     -------
@@ -454,7 +498,7 @@ def rough_heston_root_pade_f0(
 
     q_coeff = np.zeros((N_u, n), dtype=np.complex128)
     if n > 0:
-        if tail_match and alpha < 1.0 - tail_match_alpha_tol:
+        if tail_match:
             # Tail-matched system: keep short-time equations for powers l=m+1..m+n-1
             # (rows 0..n-2), replace row n-1 with the leading 1/x tail constraint
             #   p_m - C_exact * q_n = 0
@@ -540,7 +584,7 @@ def rough_heston_pade_f0(
     t            : (N_t,) float  — time grid (e.g. ctx.grid.t)
     param        : RoughHestonParam — model parameters (.rho, .nu, .lam accessed)
     pade_order   : str — "22", "33", or "44"
-    H_anchor     : float — anchor Hurst exponent; only 0.0 supported now
+    H_anchor     : float — anchor Hurst exponent, in (-1/2, 1/2]
 
     Returns
     -------

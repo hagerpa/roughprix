@@ -14,7 +14,7 @@ from scipy.special import gamma
 
 from roughprix import fourier
 from roughprix.heston import rough_heston
-from roughprix.heston.base_solution import _heuristic_measure_L, _heuristic_measure_panels
+from roughprix.heston.base_solution import _heuristic_measure_panels
 from roughprix.heston.rough_heston import (
     RoughHeston,
     HestonExpansionState,
@@ -82,20 +82,23 @@ def test_log_charfun_shape(model):
 # 4. Measure quadrature benchmarks  (--run-slow required)
 # ---------------------------------------------------------------------------
 
+# Call prices for the model fixture (set A, H = 0.3; S_0 = 1, r = 0) at benchmark_K, from
+# reference_pricer.py (out-of-the-money prices, converted by put-call parity).  Both error
+# estimates of the reference stay below 1e-9, a tenth of the tolerance.
 BENCH_T025 = np.array([
-    1.824563450995e-01,
-    1.005775136572e-01,
-    2.527006517043e-02,
-    4.455204459069e-04,
-    3.165119239522e-06,
+    1.824589207845e-01,
+    1.005752929863e-01,
+    2.527155824434e-02,
+    4.455133200754e-04,
+    3.134127954052e-06,
 ])
 
 BENCH_T10 = np.array([
-    1.920489890039e-01,
-    1.166939964537e-01,
-    4.630832094165e-02,
-    6.976869640744e-03,
-    7.860922747903e-04,
+    1.920492812469e-01,
+    1.166940430529e-01,
+    4.630834673503e-02,
+    6.976843284196e-03,
+    7.860788380978e-04,
 ])
 
 
@@ -201,13 +204,6 @@ def test_log_charfun_from_field_f0_vs_expansion_order0(model):
 # ---------------------------------------------------------------------------
 # 7. Domain heuristic
 # ---------------------------------------------------------------------------
-
-def test_heuristic_L_wide_moneyness():
-    """Wide moneyness (kmax=0.6) at T=0.25 should choose L=500."""
-    # raw = 160 * (1 + 0.75*0.6) / sqrt(0.25) = 160 * 1.45 / 0.5 = 464 → rounds to 500
-    L = _heuristic_measure_L(T=0.25, kmax=0.6)
-    assert L == 500.0
-
 
 def test_heuristic_panels_structure():
     """Heuristic panels must start at 0, end at L, and be strictly increasing."""
@@ -916,7 +912,7 @@ def test_zero_anchor_pade33_eur_call_put_finite():
     m = _make_model_anchored(0.4, expansion_base="pade", pade_order="33")
     result = m.eur_call_put(
         K=np.array([0.9, 1.0, 1.1]), maturity=_ZERO_T, expansion_order=0,
-        time_steps=_ZERO_STEPS,
+        time_steps=_ZERO_STEPS, accuracy_check=False,
     )
     assert np.all(np.isfinite(result))
 
@@ -1028,7 +1024,7 @@ def test_zero_anchor_relative_order2_works():
 
 
 def test_zero_anchor_relative_order3_works():
-    """anchor='zero', order=3 must now succeed."""
+    """anchor='zero', order=3 must succeed."""
     m = _make_model(0.4)
     state = m.expansion_state(
         _ZERO_ARG, maturity=_ZERO_T, order=3,
@@ -1126,7 +1122,7 @@ def test_relative_poly_order3(anchor_H):
 
 @pytest.mark.parametrize("anchor_H", [0.0, 0.5])
 def test_relative_kernel_matches_hardcoded_order1(anchor_H):
-    """Generic builder must match the old hardcoded K[1] formula."""
+    """Generic builder must match K[1] = (raw_1 - digamma(H0 + 1/2) raw_0) / Gamma(H0 + 1/2)."""
     from roughprix.heston.integration import TimeGrid
     from scipy.special import digamma
     grid = TimeGrid.uniform(T=1.0, J=40)
@@ -1148,7 +1144,7 @@ def test_relative_kernel_matches_hardcoded_order1(anchor_H):
 
 @pytest.mark.parametrize("anchor_H", [0.0, 0.5])
 def test_relative_kernel_matches_hardcoded_order2(anchor_H):
-    """Generic builder must match the old hardcoded K[2] formula."""
+    """Generic builder must match K[2] = (raw_2 - 2 psi raw_1 + (psi^2 - psi') raw_0) / Gamma(H0 + 1/2)."""
     from roughprix.heston.integration import TimeGrid
     from scipy.special import digamma, polygamma
     grid = TimeGrid.uniform(T=1.0, J=40)
@@ -1376,21 +1372,24 @@ def test_direct_riccati_higher_order_smoke(order):
     )
 
 
-def test_direct_riccati_pricing_smoke():
+@pytest.mark.parametrize("solver", ["auto", "adams"])
+def test_direct_riccati_pricing_smoke(solver):
     """eur_call_put_measure_quad with base='direct_riccati' must return finite prices.
 
     The Adams predictor-corrector is an explicit method that requires fine grids
     for stability at large Fourier modes.  L=200 with time_steps=500 is safe for
     the rough-Heston parameters used here; larger L requires proportionally more
-    time_steps.
+    time_steps.  'auto' uses the implicit product-integration solver.
     """
     m = _make_model_anchored(0.1,
                               expansion_base="direct_riccati")
+    m.direct_riccati_solver = solver
     result = m.eur_call_put(
         K=np.array([0.9, 1.0, 1.1]),
         maturity=_DIRECT_T,
         expansion_order=1,
         time_steps=500,
+        time_grid="uniform",  # Adams requires it
         L=200,
         implied_vol=False,
         payoff_selection="otm",
@@ -1519,7 +1518,7 @@ def test_auto_05_uses_exact_heston():
 
 
 def test_zero_pade_matches_explicit_relative():
-    """anchor=0.0, base='pade' reproduces old zero/pade/relative path."""
+    """anchor=0.0, base='pade' is deterministic and finite."""
     m = _new_model()
     kw = dict(maturity=_NEW_API_T, order=0, time_steps=_NEW_API_STEPS, base="pade")
     st1 = m.expansion_state(_NEW_API_ARG, **kw)
@@ -1643,12 +1642,15 @@ _ADAMS_J = 200
 
 @pytest.mark.parametrize("anchor", [0.0, 0.25])
 def test_adams_direct_riccati_finite(anchor):
-    """direct_riccati base with Adams solver must be finite for anchor in (0, 0.5)."""
+    """direct_riccati base with Adams solver must be finite for anchor in [0, 0.5)."""
     m = _make_rough_model(H=0.1)
     state = m.expansion_state(
         _ADAMS_ARG, maturity=_ADAMS_T, order=0,
         time_steps=_ADAMS_J,
+        time_grid="uniform",
+        anchor=anchor,
         base="direct_riccati",
+        direct_riccati_solver="adams",
     )
     f0 = np.array(state.f0.values)
     assert f0.shape == (len(_ADAMS_ARG), _ADAMS_J + 1)
@@ -1656,11 +1658,13 @@ def test_adams_direct_riccati_finite(anchor):
     np.testing.assert_array_almost_equal(np.abs(f0[:, 0]), 0.0, decimal=14)
 
 
+@pytest.mark.filterwarnings("ignore:base='direct_riccati' at anchor H = 1/2")
 def test_adams_direct_riccati_anchor05_close_to_exact_heston():
     """anchor=0.5, base='direct_riccati' should be close to base='exact_heston'."""
     m = _make_rough_model(H=0.5)
-    kw = dict(maturity=_ADAMS_T, order=0, time_steps=_ADAMS_J)
-    state_adams = m.expansion_state(_ADAMS_ARG, base="direct_riccati", **kw)
+    kw = dict(maturity=_ADAMS_T, order=0, time_steps=_ADAMS_J, time_grid="uniform")
+    state_adams = m.expansion_state(_ADAMS_ARG, base="direct_riccati",
+                                    direct_riccati_solver="adams", **kw)
     state_exact = m.expansion_state(_ADAMS_ARG, base="exact_heston", **kw)
     f0_adams = np.array(state_adams.f0.values)
     f0_exact = np.array(state_exact.f0.values)
@@ -1682,7 +1686,8 @@ def test_adams_benchmark_vs_root_pade_small_contour():
     """direct_riccati and root_pade should agree to within 5% on a small Fourier contour."""
     param = RoughHestonParam(lam=0.3, theta=0.006, nu=0.3, rho=-0.7, V0=0.02, H=0.1)
     m_dr = RoughHeston(param, riskfree=0.0,
-                       base_solution="direct_riccati")
+                       base_solution="direct_riccati",
+                       direct_riccati_solver="adams")
     m_rp = RoughHeston(param, riskfree=0.0,
                        base_solution="root_pade")
     kw_common = dict(
@@ -1692,6 +1697,7 @@ def test_adams_benchmark_vs_root_pade_small_contour():
         L=80,
         implied_vol=False,
         payoff_selection="otm",
+        time_grid="uniform",
     )
     prices_dr = m_dr.eur_call_put(time_steps=_ADAMS_J, **kw_common)
     prices_rp = m_rp.eur_call_put(time_steps=50, **kw_common)
@@ -1717,7 +1723,7 @@ def test_implicit_pi_agrees_with_adams_uniform_anchor0():
     m = RoughHeston(_PI_PARAM, riskfree=0.0,
                     base_solution="direct_riccati")
     kw = dict(arg=_PI_ARG, maturity=_PI_T, order=0,
-              time_steps=_PI_J,
+              time_steps=_PI_J, time_grid="uniform",
               base="direct_riccati", return_lists=False)
     state_adams = m.expansion_state(**kw, direct_riccati_solver="adams")
     state_pi    = m.expansion_state(**kw, direct_riccati_solver="implicit_pi")
@@ -1765,3 +1771,77 @@ def test_auto_selects_implicit_pi_for_negative_anchor():
                                time_steps=_PI_J, base="direct_riccati")
     assert np.all(np.isfinite(np.array(state.expansion.values))), \
         "auto mode should route to implicit_pi for anchor<0 and remain finite"
+
+
+@pytest.mark.filterwarnings("ignore:base='direct_riccati' at anchor H = 1/2")
+@pytest.mark.parametrize("H", [0.0, 0.1, 0.3, 0.5])
+def test_auto_selects_implicit_pi_for_nonnegative_anchor(H):
+    """'auto' must use implicit_pi for H >= 0 on a uniform grid too; Adams is opt-in."""
+    param = RoughHestonParam(lam=0.3, theta=0.006, nu=0.3, rho=-0.7, V0=0.02, H=H)
+    m = RoughHeston(param, riskfree=0.0, base_solution="direct_riccati")
+    kw = dict(maturity=_PI_T, order=0, time_steps=_PI_J, base="direct_riccati",
+              time_grid="uniform")
+    f0_auto = np.array(m.expansion_state(_PI_ARG, **kw).f0.values)
+    f0_pi = np.array(m.expansion_state(
+        _PI_ARG, direct_riccati_solver="implicit_pi", **kw).f0.values)
+    np.testing.assert_array_equal(f0_auto, f0_pi)
+
+
+def test_direct_riccati_defaults_finite_at_h0():
+    """Library defaults with base='direct_riccati' at H = 0, T = 1 give finite implied vols."""
+    param = RoughHestonParam(lam=0.3, theta=0.006, nu=0.3, rho=-0.7, V0=0.02, H=0.0)
+    K = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
+    m_dr = RoughHeston(param, riskfree=0.0, base_solution="direct_riccati")
+    iv_dr = np.asarray(m_dr.eur_call_put(K=K, maturity=1.0, implied_vol=True))
+    assert np.all(np.isfinite(iv_dr)), f"non-finite implied vols: {iv_dr}"
+    # Cross-check against root-Pade, which is within a few bp of the
+    # reference for these parameters.
+    m_rp = RoughHeston(param, riskfree=0.0, base_solution="root_pade")
+    iv_rp = np.asarray(m_rp.eur_call_put(K=K, maturity=1.0, implied_vol=True,
+                                         time_steps=200))
+    np.testing.assert_allclose(iv_dr, iv_rp, atol=5e-4, rtol=0)
+
+
+@pytest.mark.parametrize("scale", [1e-8, 1e-14])
+def test_implicit_pi_small_c_keeps_relative_precision(scale):
+    """For small c the solution is linear in c, to relative order c.
+
+    Each step solves a psi^2 - d psi + r = 0 with a = gam w / 2, d = 1 + w beta and
+    r = hist + w c, for the root near r / d.  As (d - sqrt(d^2 - 4 a r)) / (2 a) it
+    cancels for small r; implicit-pi takes 2 r / (d + sqrt(d^2 - 4 a r)), which keeps
+    the relative precision down to |c| ~ 1e-14.
+    """
+    from roughprix.heston.integration import ProductIntegrationRiccatiSolver, TimeGrid
+
+    grid = TimeGrid.uniform(T=_PI_T, J=_PI_J)
+    alpha = _PI_PARAM.H + 0.5
+    c = np.array([-0.6 + 0.3j, 0.2 - 0.9j])
+    beta = np.array([0.3 - 0.4j, 0.3 + 1.1j])
+    # gam = 0 leaves the linear equation, whose solution is exactly linear in c
+    lin = np.asarray(ProductIntegrationRiccatiSolver(grid, alpha, c, beta, 0.0).solve().values)
+    psi = np.asarray(ProductIntegrationRiccatiSolver(
+        grid, alpha, scale * c, beta, _PI_PARAM.nu ** 2).solve().values)
+    np.testing.assert_allclose(psi / scale, lin, rtol=1e-6)
+
+
+@pytest.mark.parametrize("H", [0.3, 0.1, -0.2])
+def test_auto_base_is_implicit_pi_away_from_half(H):
+    """base_solution='auto' uses direct_riccati with implicit-pi for H != 1/2."""
+    param = RoughHestonParam(lam=0.3, theta=0.006, nu=0.3, rho=-0.7, V0=0.02, H=H)
+    auto = RoughHeston(param, riskfree=0.01)
+    pi = RoughHeston(param, riskfree=0.01, base_solution="direct_riccati",
+                     direct_riccati_solver="implicit_pi")
+    kw = dict(maturity=_PI_T, time_steps=_PI_J)
+    np.testing.assert_array_equal(auto.log_charfun(_PI_ARG, **kw), pi.log_charfun(_PI_ARG, **kw))
+    K = np.array([0.9, 1.0, 1.1])
+    np.testing.assert_array_equal(np.asarray(auto.eur_call_put(K=K, **kw)),
+                                  np.asarray(pi.eur_call_put(K=K, **kw)))
+
+
+def test_auto_base_is_exact_heston_at_half():
+    param = RoughHestonParam(lam=0.3, theta=0.006, nu=0.3, rho=-0.7, V0=0.02, H=0.5)
+    K = np.array([0.9, 1.0, 1.1])
+    np.testing.assert_array_equal(
+        np.asarray(RoughHeston(param, riskfree=0.01).eur_call_put(K=K, maturity=_PI_T)),
+        np.asarray(RoughHeston(param, riskfree=0.01, base_solution="exact_heston").eur_call_put(
+            K=K, maturity=_PI_T)))

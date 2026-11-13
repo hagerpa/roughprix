@@ -119,13 +119,14 @@ def compare_h0_bases(maturity: float = 0.25, print_output: bool = True):
 # pytest integration: sanity checks on the diagnostic output
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(scope="module")
+def rows():
+    # Use T=0.25 so y=sqrt(T)=0.5, within the series convergence radius
+    return compare_h0_bases(maturity=0.25, print_output=False)
+
+
 class TestSeriesPadeDiagnostic:
     """Smoke-test that the diagnostic comparison runs without errors."""
-
-    @pytest.fixture(scope="class")
-    def rows(self):
-        # Use T=0.25 so y=sqrt(T)=0.5, within the series convergence radius
-        return compare_h0_bases(maturity=0.25, print_output=False)
 
     def test_returns_rows(self, rows):
         assert len(rows) > 0

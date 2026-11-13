@@ -22,14 +22,18 @@ def make_grid(T=1.0, J=200):
 
 
 def quad_ref(kernel_fn, f_fn, t_vals):
-    """Reference values via scipy.integrate.quad at each t in t_vals."""
+    """Reference values via scipy.integrate.quad at each t in t_vals.
+
+    Relative tolerance 1e-8 (within 2e-9 of the closed forms here): QUADPACK cannot certify 1e-10
+    at a (t - s)^(-1/2) log(t - s)^k singularity.
+    """
     out = np.zeros(len(t_vals))
     for i, t in enumerate(t_vals):
         if t <= 0.0:
             out[i] = 0.0
             continue
         val, _ = sci_integrate.quad(lambda s: kernel_fn(t, s) * f_fn(s), 0.0, t,
-                                    limit=200, epsabs=1e-10, epsrel=1e-10)
+                                    limit=200, epsabs=1e-10, epsrel=1e-8)
         out[i] = val
     return out
 
@@ -118,6 +122,13 @@ class TestFracKernel:
         K = Integrate(grid, kernel="frac", order=-0.5)
         Omega = K.weights_matrix
         assert Omega.shape == (31, 31)
+
+    def test_weights_matrix_of_a_definite_integral_raises_naming_it(self):
+        # A definite frac integral stores only its row at stop, so there is no matrix to return.
+        grid = make_grid(T=1.0, J=30)
+        K = Integrate(grid, kernel="frac", order=-0.5, stop=1.0)
+        with pytest.raises(ValueError, match=r"kernel='frac' and stop index 30"):
+            _ = K.weights_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +343,8 @@ class TestSolverShapes:
         x = solver.solve(rhs, coeff)
 
         residual = x - rhs - 0.15 * (K @ (coeff * x))
+        assert residual.values.shape == (N, J + 1)
+        np.testing.assert_allclose(np.abs(residual.values), 0.0, atol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -486,3 +499,23 @@ class TestAdamsFractionalRiccatiSolver:
         result = solver.solve()
         assert isinstance(result, Field)
         assert result.values.shape == (51,)
+
+# ---------------------------------------------------------------------------
+# Exponential-kernel cumulative integral (exact-Heston linearized solve)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("D", [0.0, 1e-7, 0.5 + 2.0j, 300.0 + 50.0j, 3000.0 - 800.0j])
+def test_exp_kernel_cumulative_exact_for_linear_phi(D):
+    """I(t) = int_0^t exp(-D (t - s)) (1 + 2 s) ds is reproduced exactly on any grid and any D dt."""
+    from roughprix.heston.integration import exp_kernel_cumulative, exp_kernel_weights
+
+    t = np.concatenate([[0.0], np.geomspace(1e-4, 1.0, 40)])
+    phi = (1.0 + 2.0 * t)[None, :].astype(np.complex128)
+    got = exp_kernel_cumulative(phi, *exp_kernel_weights(np.array([D]), t))[0]
+    if abs(D) < 1e-3:   # series: sum_k (-D)^k [t^(k+1)/(k+1)! + 2 t^(k+2)/(k+2)!]
+        exact = sum((-D) ** k * (t ** (k + 1) / _math.factorial(k + 1) + 2 * t ** (k + 2) / _math.factorial(k + 2))
+                    for k in range(6))
+    else:
+        e = -np.expm1(-D * t)                       # 1 - exp(-D t)
+        exact = e / D + 2.0 * (t / D - e / D ** 2)
+    np.testing.assert_allclose(got, exact, rtol=1e-9, atol=1e-13)

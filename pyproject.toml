@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "European option pricing for the rough Heston model with H-expansion"
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Paul P. Hager", email = "hagerpa@gmail.com" },
 ]
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Intended Audience :: Science/Research",
 ]
@@ -32,6 +33,10 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/hagerpa/roughprix"
 Repository = "https://github.com/hagerpa/roughprix"
+Changelog = "https://github.com/hagerpa/roughprix/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Union, Literal, Tuple
 
 import numpy as np
@@ -435,6 +436,52 @@ def _build_weights_frac_nb(t: np.ndarray, j_start: int, alpha: float) -> np.ndar
 
 
 @njit(cache=True, fastmath=False)
+def _build_weights_frac_row_nb(t: np.ndarray, j_start: int, alpha: float, j: int) -> np.ndarray:
+    """Row j of _build_weights_frac_nb, with the same arithmetic."""
+    row = np.zeros(t.size, dtype=np.float64)
+    if j <= j_start:
+        return row
+    tj = t[j]
+    for m in range(j_start, j):
+        a = t[m]
+        b = t[m + 1]
+        h = b - a
+        I0 = _I0_frac_nb(a, b, tj, alpha)
+        I1 = _I1_frac_nb(a, b, tj, alpha)
+        row[m] += (b * I0 - I1) / h
+        row[m + 1] += (I1 - a * I0) / h
+    return row
+
+
+def exp_kernel_weights(D: np.ndarray, t: np.ndarray):
+    """Weights for I_j = ∫_0^{t_j} exp(-D (t_j - s)) phi(s) ds with phi piecewise linear on t.
+
+    I_j = decay_j I_{j-1} + a_j phi_{j-1} + b_j phi_j holds exactly for any D * dt.
+    D has shape (N,), t shape (J+1,); each returned array has shape (N, J).
+    """
+    dt = np.diff(t)[None, :]
+    z = np.asarray(D, dtype=np.complex128)[:, None] * dt
+    small = np.abs(z) < 1e-3
+    zs = np.where(small, 1.0, z)
+    e1 = np.where(small, 1 - z / 2 + z ** 2 / 6 - z ** 3 / 24, -np.expm1(-zs) / zs)      # (1 - e^-z) / z
+    e2 = np.where(small, 0.5 - z / 6 + z ** 2 / 24 - z ** 3 / 120, (zs + np.expm1(-zs)) / zs ** 2)
+    return np.exp(-z), dt * (e1 - e2), dt * e2
+
+
+@njit(cache=True, fastmath=False)
+def exp_kernel_cumulative(phi, decay, a, b):
+    """Run I_j = decay_j I_{j-1} + a_j phi_{j-1} + b_j phi_j from I_0 = 0; time on the last axis."""
+    n, m = phi.shape
+    out = np.zeros_like(phi)
+    for i in range(n):
+        acc = 0j
+        for j in range(1, m):
+            acc = decay[i, j - 1] * acc + a[i, j - 1] * phi[i, j - 1] + b[i, j - 1] * phi[i, j]
+            out[i, j] = acc
+    return out
+
+
+@njit(cache=True, fastmath=False)
 def _F_qk_nb(u: float, q: float, k: int) -> float:
     """Antiderivative ∫ u^q log(u)^k du evaluated at u, for q > -1."""
     if u <= 0.0:
@@ -554,6 +601,9 @@ class Integrate:
                 wR[self.j_start + 1:J + 1] = 0.5 * dt[self.j_start:J]
             self._wL_jnp = jnp.asarray(wL)
             self._wR_jnp = jnp.asarray(wR)
+            if self.j_stop is not None:   # definite: the trapezoid row of t_(j_stop)
+                j = self.j_stop
+                self._row = np.append(wL[:j] + wR[:j], wR[j])
             self._Omega = None
             self._Omega_jnp = None
             self._Omega_T_C_jnp = None
@@ -571,14 +621,20 @@ class Integrate:
             self._wR_jnp = None
 
         elif self.kernel == "frac":
-            Omega = _build_weights_frac_nb(
-                t.astype(np.float64),
-                int(self.j_start),
-                float(self.order),
-            )
+            if self.j_stop is not None:   # definite: only row j_stop is used, O(J) to build
+                Omega = None
+                self._row = _build_weights_frac_row_nb(
+                    t.astype(np.float64), int(self.j_start), float(self.order), int(self.j_stop),
+                )
+            else:
+                Omega = _build_weights_frac_nb(
+                    t.astype(np.float64),
+                    int(self.j_start),
+                    float(self.order),
+                )
             self._Omega = Omega
-            self._Omega_jnp = jnp.asarray(Omega)
-            self._Omega_T_C_jnp = jnp.asarray(Omega.T)
+            self._Omega_jnp = None if Omega is None else jnp.asarray(Omega)
+            self._Omega_T_C_jnp = None if Omega is None else jnp.asarray(Omega.T)
             self._wL_jnp = None
             self._wR_jnp = None
 
@@ -621,11 +677,9 @@ class Integrate:
         X = jnp.asarray(field.values)  # (..., J+1)
 
         if self.kernel == "regular":
-            Y = self._apply_regular(X)  # (..., J+1)
             if self.j_stop is None:
-                return Field(Y, self.grid)
-            else:
-                return Y[..., self.j_stop]
+                return Field(self._apply_regular(X), self.grid)  # (..., J+1)
+            return jnp.tensordot(X[..., : self.j_stop + 1], jnp.asarray(self._row), axes=([-1], [0]))
 
         # log^k / frac / fraclog: GEMM with transposed Omega
         if self.j_stop is None:
@@ -633,22 +687,82 @@ class Integrate:
             return Field(Y, self.grid)
         else:
             j = self.j_stop
-            w = self._Omega_jnp[j, : j + 1]  # (j+1,) — static slice
+            # (j+1,) — static slice; a definite frac operator stores only its row
+            w = self._Omega_jnp[j, : j + 1] if self._Omega_jnp is not None else jnp.asarray(self._row[: j + 1])
             return jnp.tensordot(X[..., : j + 1], w, axes=([-1], [0]))
 
     @property
     def weights_matrix(self) -> np.ndarray:
         """Dense lower-triangular product-integration matrix Ω (numpy).
 
-        Available for kernel='log', 'frac', 'fraclog'.
-        Raises ValueError for kernel='regular'.
+        Available for kernel='log', 'fraclog', and 'frac' without ``stop``.
+        Raises ValueError for kernel='regular' and for a definite 'frac' integral,
+        which store only the weights they apply.
         """
         if self._Omega is None:
             raise ValueError(
-                "weights_matrix is not available for kernel='regular'; "
-                "use the built-in O(J) cumulative accumulator instead."
+                "weights_matrix is available for kernel='log', 'fraclog' and 'frac' without stop; "
+                f"this Integrate has kernel={self.kernel!r} and stop index {self.j_stop}. The regular "
+                "kernel and a definite 'frac' integral store no matrix, only the weights they apply."
             )
         return self._Omega
+
+
+# =========================
+# Blocked forward substitution
+# =========================
+
+_BLOCK = 8   # time steps per block of _blocked_forward_solve
+
+
+def _blocked_forward_solve(Omega, node, n, inputs=()):
+    """Forward substitution for the time steps j = 0..J of a lower-triangular Volterra system:
+
+        (u_j, y_j) = node(hist_j, Omega[j, j], *[x[:, j] for x in inputs]),
+        hist_j = Σ_{k<j} Omega[j, k] y_k,
+
+    with real Omega of shape (J+1, J+1), inputs of shape (n, J+1) and n values per step.
+    Returns u, shape (n, J+1).  Call it inside jax.jit.
+
+    The steps run in blocks of _BLOCK.  When a block starts, the history from all earlier
+    blocks is known, so for all its steps it is one matrix product (two real products, as
+    Omega is real); only the history within the block is summed step by step, in a scan.
+    The time axis is padded to whole blocks with zero weights and inputs; those steps enter
+    no real step and are cut off.
+    """
+    B = _BLOCK
+    J1 = Omega.shape[0]
+    n_blocks = -(-J1 // B)
+    size = n_blocks * B
+    Omega = jnp.zeros((size, size)).at[:J1, :J1].set(Omega)
+    inputs = tuple(jnp.zeros((n, size), dtype=x.dtype).at[:, :J1].set(x) for x in inputs)
+    u = jnp.zeros((n, size), dtype=jnp.complex128)
+    y_re = jnp.zeros((n, size))
+    y_im = jnp.zeros((n, size))
+
+    def block_step(carry, b):
+        u, y_re, y_im = carry
+        s = b * B
+        rows = lax.dynamic_slice_in_dim(Omega, s, B, axis=0)     # (B, size)
+        hist_far = lax.complex(y_re @ rows.T, y_im @ rows.T)      # (n, B); y is zero from column s on
+        W = lax.dynamic_slice_in_dim(rows, s, B, axis=1)          # (B, B), the weights within the block
+        x_b = tuple(lax.dynamic_slice_in_dim(x, s, B, axis=1) for x in inputs)
+
+        def step(carry, i):
+            u_b, y_b = carry                                      # (n, B) each
+            # y_b[:, k] = 0 for k >= i (not yet computed), so the dot sums the history k < i
+            u_i, y_i = node(hist_far[:, i] + y_b @ W[i], W[i, i], *(x[:, i] for x in x_b))
+            return (u_b.at[:, i].set(u_i), y_b.at[:, i].set(y_i)), None
+
+        zeros = jnp.zeros((n, B), dtype=jnp.complex128)
+        (u_b, y_b), _ = lax.scan(step, (zeros, zeros), jnp.arange(B))
+        u = lax.dynamic_update_slice_in_dim(u, u_b, s, axis=1)
+        y_re = lax.dynamic_update_slice_in_dim(y_re, jnp.real(y_b), s, axis=1)
+        y_im = lax.dynamic_update_slice_in_dim(y_im, jnp.imag(y_b), s, axis=1)
+        return (u, y_re, y_im), None
+
+    (u, _, _), _ = lax.scan(block_step, (u, y_re, y_im), jnp.arange(n_blocks))
+    return u[:, :J1]
 
 
 # =========================
@@ -659,10 +773,8 @@ class LinearVolterraSolver:
     """
     Solve x(t) = rhs(t) + scale * ∫_0^t K(t,s) coeff(s) x(s) ds
 
-    by forward substitution via jax.lax.scan.
-
-    The scan body is O(J) per step (dot product over the weight-matrix row).
-    Wrap the caller in jax.jit to compile the scan into a single fused kernel.
+    by forward substitution in blocks of time steps (see _blocked_forward_solve),
+    jitted at module level, so it compiles once per input shape.
 
     Supports batched complex arrays with time as the last axis.
     """
@@ -672,7 +784,6 @@ class LinearVolterraSolver:
         self.scale = complex(scale)
         Omega_np = K.weights_matrix          # raises for kernel='regular'
         self._Omega_jnp = jnp.asarray(Omega_np)
-        self._Omega_diag = jnp.diag(self._Omega_jnp)  # (J+1,) — diagonal for implicit term
 
     def solve(self, rhs, coeff) -> "Field":
         """
@@ -689,24 +800,21 @@ class LinearVolterraSolver:
         coeff_f = self.grid.field(coeff)
         R = jnp.asarray(rhs_f.values, dtype=jnp.complex128)    # (..., J+1)
         C = jnp.asarray(coeff_f.values, dtype=jnp.complex128)  # (..., J+1)
-        Omega = self._Omega_jnp       # (J+1, J+1)
-        diag = self._Omega_diag       # (J+1,)
-        scale = self.scale
-
-        def step(x, j):
-            # x[..., k] = 0 for k >= j (not yet computed), so the dot naturally
-            # sums only over history k < j; the diagonal term Omega[j,j]*x[j]=0.
-            row = Omega[j]                           # (J+1,)  — gather row j
-            hist = jnp.sum(row * C * x, axis=-1)    # (...,)
-            C_j = C[..., j]                          # (...,)  — dynamic slice
-            R_j = R[..., j]                          # (...,)
-            denom = 1.0 - scale * diag[j] * C_j
-            x_j = (R_j + scale * hist) / denom
-            return x.at[..., j].set(x_j), None
-
-        x0 = jnp.zeros_like(R)
-        x_final, _ = lax.scan(step, x0, jnp.arange(R.shape[-1]))
+        x_final = _linear_volterra_scan(self._Omega_jnp, R, C, scale=self.scale)
         return self.grid.field(x_final, has_time_axis=True)
+
+
+# Jitted at module level: a closure built per call would be traced and compiled on every solve.
+@partial(jax.jit, static_argnames="scale")
+def _linear_volterra_scan(Omega, R, C, scale):
+    def node(hist_j, omega_jj, R_j, C_j):
+        x_j = (R_j + scale * hist_j) / (1.0 - scale * omega_jj * C_j)
+        return x_j, C_j * x_j
+
+    R, C = jnp.broadcast_arrays(R, C)    # (..., J+1); solved as (n, J+1)
+    flat = (-1, R.shape[-1])
+    x = _blocked_forward_solve(Omega, node, R.size // R.shape[-1], (R.reshape(flat), C.reshape(flat)))
+    return x.reshape(R.shape)
 
 
 # =========================
@@ -760,12 +868,16 @@ class AdamsFractionalRiccatiSolver:
 
     where scale=1 (normalized=False) or scale=1/Gamma(alpha) (normalized=True).
 
-    ``F`` must accept ``(j, x)`` where ``j`` is a JAX integer (time index,
-    ignored for time-independent fields) and ``x`` has the batch shape.
+    ``F`` must accept ``(j, x, *F_args)`` where ``j`` is a JAX integer (time
+    index, ignored for time-independent fields) and ``x`` has the batch shape.
     Returns an array of the same batch shape.
 
     Time is the last axis; the batch dimensions are leading.  Supports
     batched complex arrays, e.g. shape ``(N_u, J+1)``.
+
+    The scan is jitted at module level with ``F`` as a static argument: a
+    module-level ``F`` with its coefficients in ``F_args`` compiles once per
+    shape, a closure built per call compiles on every solve.
 
     Parameters
     ----------
@@ -774,7 +886,9 @@ class AdamsFractionalRiccatiSolver:
     alpha : float
         Fractional order, 0 < alpha <= 1.
     F : callable
-        Vector field ``F(j, x) -> x``-shaped array.
+        Vector field ``F(j, x, *F_args) -> x``-shaped array.
+    F_args : tuple
+        Arrays passed to ``F`` after ``(j, x)``.
     normalized : bool
         If True, include the 1/Gamma(alpha) factor in the kernel.
     corrector_iterations : int
@@ -789,6 +903,7 @@ class AdamsFractionalRiccatiSolver:
         alpha: float,
         F,
         *,
+        F_args: tuple = (),
         normalized: bool = False,
         corrector_iterations: int = 1,
         blowup_threshold: float | None = 1e70,
@@ -802,6 +917,7 @@ class AdamsFractionalRiccatiSolver:
         self.grid = grid
         self.alpha = alpha
         self.F = F
+        self.F_args = tuple(F_args)
         self.corrector_iterations = int(corrector_iterations)
         self.blowup_threshold = blowup_threshold
 
@@ -816,50 +932,52 @@ class AdamsFractionalRiccatiSolver:
 
         The batch shape is inferred by calling F(0, 0) once.
         """
-        J = self.grid.J
-        F = self.F
-        B_pred = self._B_pred
-        A_hist = self._A_hist
-        a_last = self._a_last
-        n_corr = self.corrector_iterations
-
-        # Probe batch shape and dtype
-        G0 = F(jnp.array(0, dtype=jnp.int32),
-               jnp.zeros((), dtype=jnp.complex128))
-        G0 = jnp.asarray(G0, dtype=jnp.complex128)
-        batch_shape = G0.shape
-
-        h_init = jnp.zeros((*batch_shape, J + 1), dtype=jnp.complex128)
-        G_init = jnp.zeros((*batch_shape, J + 1), dtype=jnp.complex128)
-        G_init = G_init.at[..., 0].set(G0)
-
-        def scan_step(carry, j):
-            h_arr, G_arr = carry
-
-            # Predictor (Adams-Bashforth)
-            B_row = B_pred[j]                                        # (J+1,)
-            h_j = jnp.sum(B_row * G_arr, axis=-1)                   # (...,)
-
-            # Corrector iterations (Adams-Moulton PECE)
-            A_row = A_hist[j]                                        # (J+1,)
-            hist_j = jnp.sum(A_row * G_arr, axis=-1)                # (...,)
-            for _ in range(n_corr):
-                G_j_pred = F(j, h_j)
-                h_j = hist_j + a_last * G_j_pred
-
-            G_j = F(j, h_j)
-            new_h = h_arr.at[..., j].set(h_j)
-            new_G = G_arr.at[..., j].set(G_j)
-            return (new_h, new_G), None
-
-        (h_final, _), _ = lax.scan(scan_step, (h_init, G_init),
-                                   jnp.arange(1, J + 1))
+        h_final = _adams_scan(self.F, self.F_args, self._B_pred, self._A_hist, self._a_last,
+                              self.corrector_iterations)
 
         if self.blowup_threshold is not None:
             thr = float(self.blowup_threshold)
             h_final = jnp.where(jnp.abs(h_final) > thr, jnp.nan + 0j, h_final)
 
         return self.grid.field(h_final, has_time_axis=True)
+
+
+@partial(jax.jit, static_argnames=("F", "n_corr"))   # module level, as _linear_volterra_scan
+def _adams_scan(F, F_args, B_pred, A_hist, a_last, n_corr):
+    J = B_pred.shape[0] - 1
+
+    # Probe batch shape and dtype
+    G0 = F(jnp.array(0, dtype=jnp.int32),
+           jnp.zeros((), dtype=jnp.complex128), *F_args)
+    G0 = jnp.asarray(G0, dtype=jnp.complex128)
+    batch_shape = G0.shape
+
+    h_init = jnp.zeros((*batch_shape, J + 1), dtype=jnp.complex128)
+    G_init = jnp.zeros((*batch_shape, J + 1), dtype=jnp.complex128)
+    G_init = G_init.at[..., 0].set(G0)
+
+    def scan_step(carry, j):
+        h_arr, G_arr = carry
+
+        # Predictor (Adams-Bashforth)
+        B_row = B_pred[j]                                        # (J+1,)
+        h_j = jnp.sum(B_row * G_arr, axis=-1)                   # (...,)
+
+        # Corrector iterations (Adams-Moulton PECE)
+        A_row = A_hist[j]                                        # (J+1,)
+        hist_j = jnp.sum(A_row * G_arr, axis=-1)                # (...,)
+        for _ in range(n_corr):
+            G_j_pred = F(j, h_j, *F_args)
+            h_j = hist_j + a_last * G_j_pred
+
+        G_j = F(j, h_j, *F_args)
+        new_h = h_arr.at[..., j].set(h_j)
+        new_G = G_arr.at[..., j].set(G_j)
+        return (new_h, new_G), None
+
+    (h_final, _), _ = lax.scan(scan_step, (h_init, G_init),
+                               jnp.arange(1, J + 1))
+    return h_final
 
 
 class ProductIntegrationRiccatiSolver:
@@ -873,7 +991,12 @@ class ProductIntegrationRiccatiSolver:
     become unstable for hyper-rough cases H < 0 on large Fourier contours. This
     solver treats the quadratic Riccati term implicitly at each node by solving
     the arising scalar quadratic exactly, and supports uniform, graded, and
-    symmetric_graded grids.
+    symmetric_graded grids.  With product-integration weights Omega, step j reads
+
+        psi_j = hist_j + Omega[j, j] F(psi_j),   hist_j = Σ_{k<j} Omega[j, k] F(psi_k),
+
+    a quadratic in psi_j, of which the root closest to the linearised value is
+    taken.  The time steps run in blocks (see _blocked_forward_solve).
 
     Parameters
     ----------
@@ -915,53 +1038,49 @@ class ProductIntegrationRiccatiSolver:
 
     def solve(self) -> "Field":
         """Solve and return a Field with shape (n_u, J+1)."""
-        J = self.grid.J
         Omega_jnp = jnp.asarray(self._Omega)   # (J+1, J+1), real
         c = jnp.asarray(self.c, dtype=jnp.complex128)       # (n_u,)
         beta = jnp.asarray(self.beta, dtype=jnp.complex128) # (n_u,)
         half_gam = jnp.array(0.5 * self.gam, dtype=jnp.float64)
 
-        n_u = c.shape[0]
-        psi_init  = jnp.zeros((n_u, J + 1), dtype=jnp.complex128)
-        Fpsi_init = jnp.zeros((n_u, J + 1), dtype=jnp.complex128)
-        Fpsi_init = Fpsi_init.at[:, 0].set(c)
-
-        _quad_tol = jnp.array(1e-14, dtype=jnp.float64)
-
-        def scan_step(carry, j):
-            psi, Fpsi = carry
-
-            omega_j = Omega_jnp[j, j]                      # scalar, real
-            hist_j  = Fpsi @ Omega_jnp[j]                  # (n_u,) — full row, zero-padded beyond j
-
-            rhs_j   = hist_j + omega_j * c                 # (n_u,)
-            denom_j = 1.0 + omega_j * beta                 # (n_u,)
-            psi_lin = rhs_j / denom_j
-
-            a_coef  = half_gam * omega_j                   # scalar, real
-            disc    = denom_j ** 2 - 4.0 * a_coef * rhs_j
-            sqrt_disc = jnp.sqrt(disc)
-            root1 = (denom_j + sqrt_disc) / (2.0 * a_coef)
-            root2 = (denom_j - sqrt_disc) / (2.0 * a_coef)
-            # pick root closest to the linearised value; fall back to psi_lin when a_coef≈0
-            use_quad = jnp.abs(a_coef) >= _quad_tol
-            closer1  = jnp.abs(root1 - psi_lin) <= jnp.abs(root2 - psi_lin)
-            psi_quad = jnp.where(closer1, root1, root2)
-            psi_j    = jnp.where(use_quad, psi_quad, psi_lin)
-
-            Fpsi_j = c - beta * psi_j + half_gam * psi_j ** 2
-            psi  = psi.at[:, j].set(psi_j)
-            Fpsi = Fpsi.at[:, j].set(Fpsi_j)
-            return (psi, Fpsi), None
-
-        (psi_final, _), _ = lax.scan(scan_step, (psi_init, Fpsi_init),
-                                     jnp.arange(1, J + 1))
+        psi_final = _implicit_pi_scan(Omega_jnp, c, beta, half_gam)
 
         if self.blowup_threshold is not None:
             thr = float(self.blowup_threshold)
             psi_final = jnp.where(jnp.abs(psi_final) > thr, jnp.nan + 0j, psi_final)
 
         return self.grid.field(psi_final, has_time_axis=True)
+
+
+@jax.jit   # module level, as _linear_volterra_scan
+def _implicit_pi_scan(Omega_jnp, c, beta, half_gam):
+    _quad_tol = jnp.array(1e-14, dtype=jnp.float64)
+
+    def node(hist_j, omega_j):
+        # step 0 has omega_j = 0 (row 0 of Omega is zero): psi = 0 and F(psi) = c
+        rhs_j   = hist_j + omega_j * c                 # (n_u,)
+        denom_j = 1.0 + omega_j * beta                 # (n_u,)
+        psi_lin = rhs_j / denom_j
+
+        a_coef  = half_gam * omega_j                   # scalar, real
+        disc    = denom_j ** 2 - 4.0 * a_coef * rhs_j
+        sqrt_disc = jnp.sqrt(disc)
+        # sign so that denom_j + sqrt_disc does not cancel; the other root is
+        # rhs_j / (a_coef * root1), free of the cancellation in denom_j - sqrt_disc
+        sqrt_disc = jnp.where(jnp.real(jnp.conj(denom_j) * sqrt_disc) < 0, -sqrt_disc, sqrt_disc)
+        big     = denom_j + sqrt_disc
+        root1 = big / (2.0 * a_coef)
+        root2 = 2.0 * rhs_j / big
+        # pick root closest to the linearised value; fall back to psi_lin when a_coef≈0
+        use_quad = jnp.abs(a_coef) >= _quad_tol
+        closer1  = jnp.abs(root1 - psi_lin) <= jnp.abs(root2 - psi_lin)
+        psi_quad = jnp.where(closer1, root1, root2)
+        psi_j    = jnp.where(use_quad, psi_quad, psi_lin)
+
+        Fpsi_j = c - beta * psi_j + half_gam * psi_j ** 2
+        return psi_j, Fpsi_j
+
+    return _blocked_forward_solve(Omega_jnp, node, c.shape[0])
 
 
 def suggested_time_grid_power(anchor_H: float) -> float:

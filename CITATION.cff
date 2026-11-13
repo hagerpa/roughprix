@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "roughprix: option pricing in the rough Heston model"
+abstract: >-
+  European option pricing for rough stochastic volatility models via Fourier inversion,
+  with a Taylor expansion of the characteristic function in the Hurst exponent H.
+authors:
+  - family-names: Hager
+    given-names: Paul P.
+    affiliation: University of Vienna
+version: 0.1.0
+license: Apache-2.0
+repository-code: "https://github.com/hagerpa/roughprix"
+keywords:
+  - rough volatility
+  - rough Heston model
+  - option pricing
+  - Hurst exponent
+  - Fourier pricing
+  - JAX
+references:
+  - type: article
+    title: "Expanding the rough Heston model in H"
+    authors:
+      - family-names: Hager
+        given-names: Paul P.
+      - family-names: Kreher
+        given-names: Dörte
+    year: 2026
+    url: "https://arxiv.org/abs/2606.16619"

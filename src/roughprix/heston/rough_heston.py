@@ -1,12 +1,17 @@
+import warnings
 from dataclasses import dataclass
 from math import comb, factorial
 from typing import Callable, Literal
 
 import numpy as np
+import jax
 import jax.numpy as jnp
+from jax import lax
 from scipy.special import gamma
 
-from .integration import Field, Integrate, TimeGrid, suggested_time_grid_power
+from .integration import (
+    Field, Integrate, TimeGrid, exp_kernel_cumulative, exp_kernel_weights, suggested_time_grid_power,
+)
 
 
 @dataclass(slots=True)
@@ -78,6 +83,10 @@ class HestonExpansionState:
         ``return_lists=True`` is passed to :meth:`~RoughHeston.expansion_state`.
     F_list : list[Field] or None
         Corresponding Riccati RHS evaluations; populated alongside ``f_list``.
+    target_H : float or None
+        Hurst exponent at which ``expansion`` is evaluated.
+    anchor_H : float or None
+        Expansion anchor H₀.
     """
     grid: TimeGrid
     u: np.ndarray
@@ -89,6 +98,8 @@ class HestonExpansionState:
     kappa_path_reflected: object  # Field
     f_list: list | None = None
     F_list: list | None = None
+    target_H: float | None = None
+    anchor_H: float | None = None
 
 
 @dataclass(slots=True)
@@ -116,28 +127,39 @@ class AnchorExpansionOps:
     f0: object  # Field: base Riccati solution at anchor
     K: object  # dict[int, Integrate]: log^k kernel operators
     solve_linearized: Callable  # [[Field], Field]: linear resolvent
+    log_phi_anchor: np.ndarray | None = None  # closed-form log CF at target H = anchor, if known
 
 
 class _LinearCombOp:
-    """Weighted sum of integration operators: result = Σ_i c_i * (K_i @ obj)."""
+    """Weighted sum of integration operators: result = Σ_i c_i * (K_i @ obj).
+
+    The dense terms are summed into one matrix up front, so an application costs one matrix
+    product, not one per term; a kernel='regular' term keeps its O(J) cumulative sum.
+    """
 
     def __init__(self, terms: list):
-        self._terms = terms  # list of (float, Integrate) pairs
+        self._grid = terms[0][1].grid
+        self._regular = [(c, K) for c, K in terms if K.kernel == "regular"]
+        self._Omega = None  # Σ c_i Ω_i over the dense terms
+        for c, K in terms:
+            if K.kernel != "regular":
+                m = c * K.weights_matrix
+                self._Omega = m if self._Omega is None else self._Omega + m
+        self._Omega_T = None if self._Omega is None else jnp.asarray(self._Omega.T)
 
     def __matmul__(self, obj):
-        result = None
-        for c, K in self._terms:
-            term = c * (K @ obj)
+        field = self._grid.field(obj)
+        result = None if self._Omega_T is None else Field(jnp.matmul(field.values, self._Omega_T), self._grid)
+        for c, K in self._regular:
+            term = c * (K @ field)
             result = term if result is None else result + term
         return result
 
     @property
     def weights_matrix(self):
-        result = None
-        for c, K in self._terms:
-            m = c * K.weights_matrix
-            result = m if result is None else result + m
-        return result
+        if self._regular:
+            raise ValueError("weights_matrix is not available for kernel='regular'")
+        return self._Omega
 
 
 def _raw_kernel_op(grid: TimeGrid, anchor_H: float, log_order: int) -> Integrate:
@@ -219,6 +241,22 @@ def _build_kernel_derivative_ops(
     return K
 
 
+# Jitted at module level: a closure built per call would be traced and compiled on every solve.
+@jax.jit
+def _left_rectangle_scan(R, dt, Fx0):
+    def _step(acc, j):
+        x_j = R[..., j] + acc
+        return acc + dt[j] * Fx0[..., j] * x_j, x_j
+
+    _, x_cols = lax.scan(_step, jnp.zeros(R.shape[:-1], dtype=jnp.complex128), jnp.arange(R.shape[-1]))
+    return jnp.moveaxis(x_cols, 0, -1)
+
+
+# Module level, so the Adams scan, which takes it as a static argument, compiles once per shape.
+def _riccati_rhs(j, x, c, beta, half_gam):
+    return c - beta * x + half_gam * x * x
+
+
 class RoughHeston(object):
     """Rough Heston model pricer based on a fractional-Riccati Taylor expansion.
 
@@ -227,17 +265,18 @@ class RoughHeston(object):
     to arbitrary order in ``ΔH = H_target - H₀``.  At order 0 the expansion
     collapses to the exact model characteristic function at the anchor.
 
-    The anchor Riccati solution ``h(u, t; H₀)`` is computed by one of three
-    methods selected via ``base_solution``:
+    The anchor Riccati solution ``h(u, t; H₀)`` is computed by the method
+    selected via ``base_solution``:
 
-    * ``"root_pade"``  — root-transformed Padé approximant (default away from H₀ = ½).
+    * ``"root_pade"``  — root-transformed Padé approximant.
     * ``"exact_heston"`` — closed-form classical Heston (only valid at H₀ = ½).
     * ``"pade"``       — Gatheral Padé [m/m] approximant.
     * ``"direct_riccati"`` — numerical fractional ODE solver (Adams or implicit-π).
-    * ``"auto"``       — ``"exact_heston"`` when ``H₀ = ½``, else ``"root_pade"``.
+    * ``"auto"``       — ``"exact_heston"`` when ``H₀ = ½``, else ``"direct_riccati"``
+      with implicit-π.
 
     European option prices are computed via Fourier inversion on the Lewis
-    contour (``R = 0.5``) or a shifted damped-payoff contour (``R > 0.5``).
+    contour (``R = 0.5``) or a damped-payoff contour (any other ``R``).
     """
 
     def __init__(
@@ -247,9 +286,10 @@ class RoughHeston(object):
             base_solution: str = "auto",
             pade_order: str = "22",
             root_pade_series_order: int | None = None,
-            root_pade_degree: int = 7,
-            root_pade_tail_match: bool = False,
+            root_pade_degree: int = 9,
+            root_pade_tail_match: bool = True,
             direct_riccati_solver: Literal["auto", "adams", "implicit_pi"] = "auto",
+            log_cf_integrand: Literal["auto", "solution", "rhs"] = "auto",
     ):
         """Initialise the rough Heston pricer.
 
@@ -262,21 +302,45 @@ class RoughHeston(object):
         base_solution : {"auto", "root_pade", "exact_heston", "pade", "direct_riccati"}
             Method used to solve the base Riccati equation at the anchor.
             ``"auto"`` selects ``"exact_heston"`` when ``param.H == 0.5``,
-            otherwise ``"root_pade"``.
+            otherwise ``"direct_riccati"`` with the implicit-π solver, the most
+            stable and accurate choice; ``"root_pade"`` is faster.  The
+            approximate bases warn at ``param.H == 0.5``, where
+            ``"exact_heston"`` is exact.
         pade_order : {"22", "33", "44"}
             Padé order; only used when ``base_solution="pade"``.
         root_pade_series_order : int or None
             Number of short-time series coefficients for the root-Padé solve;
             ``None`` defaults to ``2 * root_pade_degree + 1``.
         root_pade_degree : int
-            Numerator degree ``m`` of the ``[m/(m+1)]`` root-Padé approximant.
+            Numerator degree ``m`` of the ``[m/(m+1)]`` root-Padé approximant
+            (default 9; Hager & Kreher 2026 use 7).
         root_pade_tail_match : bool
-            If ``True``, replace the highest short-time Padé equation with the
-            exact leading ``1/x`` tail constraint, improving large-maturity accuracy.
+            If ``True`` (the default), replace the highest short-time Padé
+            equation with the exact leading ``1/x`` tail constraint.  This is
+            much more accurate for H < 0 and for steep skews.
         direct_riccati_solver : {"auto", "adams", "implicit_pi"}
             Fractional ODE solver when ``base_solution="direct_riccati"``.
-            ``"auto"`` selects ``"implicit_pi"`` for ``H < 0`` or non-uniform grids.
+            ``"auto"`` selects ``"implicit_pi"``.  ``"adams"`` is opt-in and
+            requires a uniform time grid.
+        log_cf_integrand : {"auto", "solution", "rhs"}
+            What the log characteristic function integrates over ``[0, T]``.
+            ``"solution"`` integrates the Riccati solution h:
+            ``θ·I¹h(T) + V0·I^(1-α)h(T)`` (El Euch & Rosenbaum 2019).
+            ``"rhs"`` integrates the Riccati right-hand side F(h):
+            ``∫ F(h(s)) (V0 + θ (T-s)^α / Γ(1+α)) ds``, the formula of
+            Hager & Kreher (2026), Eq. (1.1), which the paper's numbers use
+            (see "Reproducing the paper" in the README for the other
+            settings).  Both are exact for the exact h.  ``"rhs"`` equals
+            ``"solution"`` after one fixed-point step with the target kernel:
+            that restores the target's short-time behaviour t^α, which the
+            H-expansion carries only through powers of ΔH·log t, but amplifies
+            the error of an approximate h by about ν|u|.  ``"auto"`` (the
+            default) uses ``"rhs"`` for expansions from the anchor H₀ = ½,
+            where it is the more accurate of the two in tests, and
+            ``"solution"`` otherwise.
         """
+        if log_cf_integrand not in ("auto", "solution", "rhs"):
+            raise ValueError(f"log_cf_integrand must be 'auto', 'solution' or 'rhs', got {log_cf_integrand!r}")
         self.param = param
         self.riskfree = riskfree
         self.base_solution = base_solution
@@ -285,13 +349,16 @@ class RoughHeston(object):
         self.root_pade_degree = root_pade_degree
         self.root_pade_tail_match = root_pade_tail_match
         self.direct_riccati_solver = direct_riccati_solver
+        self.log_cf_integrand = log_cf_integrand
+        self._field_cache = None   # dict while eur_call_put runs its accuracy check
+        self._extra_order = 0      # 1 while that check needs the next expansion order
 
     def expansion_state(
             self,
             arg: np.ndarray,
             maturity: float = 1.0,
             order: int = 0,
-            time_steps: int = 100,
+            time_steps: int = 400,
             H: float | None = None,
             return_lists: bool = False,
             anchor: float | None = None,
@@ -300,7 +367,7 @@ class RoughHeston(object):
             root_pade_degree: int | None = None,
             root_pade_series_order: int | None = None,
             root_pade_tail_match: bool | None = None,
-            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "uniform",
+            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "graded",
             grid_power: float | None = None,
             direct_riccati_solver: Literal["auto", "adams", "implicit_pi"] | None = None,
     ) -> HestonExpansionState:
@@ -398,6 +465,8 @@ class RoughHeston(object):
             kappa_path_reflected=ctx.kappa_path_reflected,
             f_list=f_list,
             F_list=F_list,
+            target_H=target_H,
+            anchor_H=anchor_eff,
         )
 
     # ------------------------------------------------------------------
@@ -483,30 +552,46 @@ class RoughHeston(object):
         nu_eff = self.param.nu / ctx.alpha
         rho = self.param.rho
 
-        # Heston discriminant (scalar arrays over u)
+        # Heston discriminant (scalar arrays over u).  At u = 0 and u = -i the constant
+        # c = -u(u+i)/2 vanishes and h = 0 is exact, but G is 0/0 or x/0 there (u = 0
+        # with lam = 0, u = -i with lam <= rho*nu).  D = beta and G = 0 give h = 0.
         beta_eff = lam_eff - rho * nu_eff * ctx.u * 1j
-        D_raw = np.sqrt(beta_eff ** 2 + (ctx.u + 1j) * ctx.u * nu_eff ** 2)
-        G_raw = (beta_eff - D_raw) / (beta_eff + D_raw)
+        trivial = ctx.u * (ctx.u + 1j) == 0
+        D_raw = np.where(trivial, beta_eff, np.sqrt(beta_eff ** 2 + (ctx.u + 1j) * ctx.u * nu_eff ** 2))
+        G_raw = np.divide(beta_eff - D_raw, beta_eff + D_raw, out=np.zeros_like(beta_eff), where=~trivial)
+
+        # Closed-form log CF at H = 1/2.  The variance kernel is V0 + theta*(T - s), so
+        # integrating F(h(s)) against it by parts gives V0*h(T) + theta*int_0^T h(s) ds.
+        eDT = np.exp(-D_raw * ctx.grid.T)
+        h_T = (beta_eff - D_raw) * (1 - eDT) / (ctx.gam * (1 - G_raw * eDT))
+        int_h = ((beta_eff - D_raw) * ctx.grid.T - 2 * np.log((1 - G_raw * eDT) / (1 - G_raw))) / ctx.gam
+        log_phi_anchor = 1j * ctx.u * self.riskfree * ctx.grid.T + ctx.V0 * h_T + ctx.theta * int_h
 
         D = ctx.grid.field(D_raw)
         G = ctx.grid.field(G_raw)
         eD = np.exp(-D * ctx.time)
 
         f0 = ctx.gam ** -1 * (ctx.beta - D) * (1 - eD) / (1 - G * eD)
-        eG0 = (1 - G * eD) * (1 - G * eD) / eD
+        w = (1 - G * eD) * (1 - G * eD)
         g = -ctx.beta + ctx.gam * f0
         del eD, D, G
 
         K = _build_kernel_derivative_ops(ctx.grid, anchor_H=0.5, order=order)
+        # f_n = h_n + w(t)^-1 ∫_0^t exp(-D (t - s)) w(s) g(s) h_n(s) ds, with the exponential
+        # integrated exactly against the piecewise-linear w g h_n: stable for any |D| dt, and
+        # |D| grows linearly in |u|.
+        exp_weights = exp_kernel_weights(D_raw, ctx.grid.t)
 
         def solve_linearized(h_n: Field) -> Field:
-            return h_n + (K[0] @ (g * eG0 * h_n)) / eG0
+            phi = np.asarray((w * g * h_n).values, dtype=np.complex128)
+            return h_n + ctx.grid.field(exp_kernel_cumulative(phi, *exp_weights), has_time_axis=True) / w
 
         return AnchorExpansionOps(
             anchor_H=0.5,
             f0=f0,
             K=K,
             solve_linearized=solve_linearized,
+            log_phi_anchor=log_phi_anchor,
         )
 
     # ------------------------------------------------------------------
@@ -519,9 +604,9 @@ class RoughHeston(object):
             base: str,
             anchor: float,
             pade_order: str = "22",
-            root_pade_degree: int = 7,
+            root_pade_degree: int = 9,
             root_pade_series_order: int | None = None,
-            root_pade_tail_match: bool = False,
+            root_pade_tail_match: bool = True,
             direct_riccati_solver: str = "auto",
     ) -> AnchorExpansionOps:
         anchor_tol = 1e-10
@@ -529,10 +614,8 @@ class RoughHeston(object):
             if abs(anchor - 0.5) < anchor_tol:
                 return self._build_exact_heston_anchor_ops(ctx, order)
             return self._build_approx_anchor_ops(
-                ctx, order, "root_pade", anchor,
-                root_pade_degree=root_pade_degree,
-                root_pade_series_order=root_pade_series_order,
-                root_pade_tail_match=root_pade_tail_match,
+                ctx, order, "direct_riccati", anchor,
+                direct_riccati_solver="implicit_pi",
             )
         if base == "exact_heston":
             if abs(anchor - 0.5) >= anchor_tol:
@@ -540,6 +623,13 @@ class RoughHeston(object):
                     f"base='exact_heston' requires anchor=0.5, got anchor={anchor!r}"
                 )
             return self._build_exact_heston_anchor_ops(ctx, order)
+        if abs(anchor - 0.5) < anchor_tol:
+            warnings.warn(
+                f"base={base!r} at anchor H = 1/2 is approximate; use 'exact_heston' (what 'auto' picks "
+                "there), which is exact.  Root-Pade loses accuracy at large u there, and expansions from "
+                "an approximate base can blow up on coarse time grids.",
+                stacklevel=2,
+            )
         return self._build_approx_anchor_ops(
             ctx, order, base, anchor,
             pade_order=pade_order,
@@ -559,9 +649,9 @@ class RoughHeston(object):
             base: str,
             anchor: float,
             pade_order: str = "22",
-            root_pade_degree: int = 7,
+            root_pade_degree: int = 9,
             root_pade_series_order: int | None = None,
-            root_pade_tail_match: bool = False,
+            root_pade_tail_match: bool = True,
             direct_riccati_solver: str = "auto",
     ) -> AnchorExpansionOps:
         if base == "pade":
@@ -584,15 +674,10 @@ class RoughHeston(object):
             _beta_np = np.asarray((lam_raw - rho * nu_raw * 1j * ctx.u) / ctx.alpha, dtype=np.complex128)
             _gam = float(nu_raw ** 2 / ctx.alpha)
 
-            # Determine which solver to use.
-            _is_uniform = np.allclose(np.diff(ctx.grid.t), np.diff(ctx.grid.t)[0],
-                                      rtol=1e-10, atol=1e-14)
-            if direct_riccati_solver == "implicit_pi":
-                _use_implicit_pi = True
-            elif direct_riccati_solver == "adams":
-                _use_implicit_pi = False
-            else:  # "auto": prefer implicit_pi for H<0 or non-uniform grids
-                _use_implicit_pi = (anchor < 0.0) or not _is_uniform
+            # "auto" is implicit-pi: it solves each step's quadratic exactly and
+            # runs on any grid.  Adams (opt-in) is explicit in F, needs a
+            # uniform grid, and can return NaN for H <= 0 or on coarse grids.
+            _use_implicit_pi = direct_riccati_solver != "adams"
 
             if _use_implicit_pi:
                 from .integration import ProductIntegrationRiccatiSolver
@@ -602,14 +687,9 @@ class RoughHeston(object):
                 f0_field = solver.solve()
             else:
                 from .integration import AdamsFractionalRiccatiSolver
-                _c_jnp = jnp.asarray(_c_np)
-                _beta_jnp = jnp.asarray(_beta_np)
-
-                def F_point(j, x):
-                    return _c_jnp - _beta_jnp * x + 0.5 * _gam * x * x
-
                 solver = AdamsFractionalRiccatiSolver(
-                    ctx.grid, alpha_anchor, F_point, normalized=False,
+                    ctx.grid, alpha_anchor, _riccati_rhs, normalized=False,
+                    F_args=(jnp.asarray(_c_np), jnp.asarray(_beta_np), 0.5 * _gam),
                 )
                 f0_field = solver.solve()
 
@@ -640,20 +720,12 @@ class RoughHeston(object):
             # Solve x = rhs + ∫_0^t Fx0(s)*x(s) ds by a forward left-rectangle
             # scan that avoids the dense Omega matrix. Uses actual panel widths
             # so nonuniform (graded) grids are handled correctly.
-            from jax import lax as _lax
             _dt_arr = jnp.asarray(np.append(np.diff(ctx.grid.t), 0.0), dtype=jnp.float64)
             _Fx0 = jnp.asarray(Fx0.values, dtype=jnp.complex128)
 
             def solve_linearized(rhs: Field) -> Field:
                 R = jnp.asarray(ctx.grid.field(rhs).values, dtype=jnp.complex128)
-
-                def _step(acc, j):
-                    x_j = R[..., j] + acc
-                    return acc + _dt_arr[j] * _Fx0[..., j] * x_j, x_j
-
-                _, x_cols = _lax.scan(_step, jnp.zeros(R.shape[:-1], dtype=jnp.complex128),
-                                      jnp.arange(R.shape[-1]))
-                return ctx.grid.field(jnp.moveaxis(x_cols, 0, -1), has_time_axis=True)
+                return ctx.grid.field(_left_rectangle_scan(R, _dt_arr, _Fx0), has_time_axis=True)
         else:
             from .integration import LinearVolterraSolver
             solver = LinearVolterraSolver(ctx.grid, K[0], scale=1.0)
@@ -707,9 +779,7 @@ class RoughHeston(object):
         return expansion, f_out, F_out
 
     def log_charfun_from_field(self, state: HestonExpansionState, field) -> np.ndarray:
-        C = Integrate(state.grid, start=0, stop="T") @ (
-                state.F_ricc(field) * state.kappa_path_reflected
-        )
+        C = self._log_cf_integral(state.grid, state.F_ricc, field, state.target_H, state.anchor_H)
         return 1j * state.u * self.riskfree * state.grid.T + C
 
     def _compute_kappa_path_reflected(self, grid: TimeGrid, H: float):
@@ -717,11 +787,26 @@ class RoughHeston(object):
         t_ref = grid.field(np.maximum(grid.T - grid.t, 0.0), has_time_axis=True)
         return self.param.V0 + (self.param.theta / gamma(H + 1.5)) * np.power(t_ref, H + 0.5)
 
-    def _log_charfun_raw(self, ctx: RiccatiContext, expansion_field, kappa_path_reflected) -> np.ndarray:
-        """Log charfun given a pre-built context, expansion field, and reflected kappa_path."""
-        C = Integrate(ctx.grid, start=0, stop="T") @ (
-                ctx.F_ricc(expansion_field) * kappa_path_reflected
-        )
+    def _log_cf_integral(self, grid: TimeGrid, F_ricc, field, H: float, anchor: float):
+        """Integral part of the log CF of the Riccati solution ``field`` at target H (see log_cf_integrand)."""
+        form = self.log_cf_integrand
+        if form == "auto":
+            form = "rhs" if abs(anchor - 0.5) < 1e-10 and abs(H - anchor) > 1e-10 else "solution"
+        if form == "rhs":
+            return Integrate(grid, start=0, stop="T") @ (
+                    F_ricc(field) * self._compute_kappa_path_reflected(grid, H)
+            )
+        al = H + 0.5
+        h = grid.field(field)
+        if al < 1.0:
+            frac = (Integrate(grid, kernel="frac", order=-al, start=0, stop="T") @ h) / gamma(1.0 - al)
+        else:  # I^0 is the identity
+            frac = h.values[..., -1]
+        return self.param.theta * (Integrate(grid, start=0, stop="T") @ h) + self.param.V0 * frac
+
+    def _log_charfun_raw(self, ctx: RiccatiContext, expansion_field, H: float) -> np.ndarray:
+        """Log charfun given a pre-built context and the expansion field at target H."""
+        C = self._log_cf_integral(ctx.grid, ctx.F_ricc, expansion_field, H, ctx.anchor_H)
         return 1j * ctx.u * self.riskfree * ctx.grid.T + C
 
     def _compute_expansion_for_H(self, f_list: list, anchor_H: float, H: float):
@@ -742,15 +827,25 @@ class RoughHeston(object):
             pade_order_eff: str,
             rpd_eff: int,
             rpso_eff,
-            rptm_eff: bool = False,
+            rptm_eff: bool = True,
             time_grid: str = "uniform",
             grid_power: float | None = None,
             direct_riccati_solver: str = "auto",
     ) -> tuple:
-        """Build context and f_list independent of H (anchor_H used as placeholder for kappa_path).
+        """Build context, f_list and anchor ops independent of H (anchor_H used as placeholder for kappa_path).
 
-        Callers must use _log_charfun_raw with the correct H-specific kappa_path.
+        Callers must pass the target H to _log_charfun_raw.  While ``self._field_cache`` is a
+        dict (during one ``eur_call_put`` call with ``accuracy_check``), results are reused,
+        and a lower order is served from the leading coefficients of a higher one.
         """
+        key = None
+        if self._field_cache is not None:
+            key = (np.asarray(arg, dtype=np.complex128).tobytes(), maturity, time_steps, anchor_eff,
+                   base_eff, pade_order_eff, rpd_eff, rpso_eff, rptm_eff, time_grid, grid_power,
+                   direct_riccati_solver)
+            hit = self._field_cache.get(key)
+            if hit is not None and len(hit[1]) > order:
+                return hit[0], hit[1][:order + 1], hit[2]
         ctx = self._build_convention_context(
             arg, maturity, time_steps,
             anchor_H=anchor_eff, target_H=anchor_eff,
@@ -767,16 +862,33 @@ class RoughHeston(object):
         _, f_list, _ = self._run_expansion_recursion(
             ctx=ctx, ops=ops, target_H=anchor_eff, order=order, return_lists=True,
         )
-        return ctx, f_list
+        if key is not None:
+            self._field_cache[key] = (ctx, f_list, ops)
+        return ctx, f_list, ops
+
+    def _expansion_fields(self, arg, maturity: float, time_steps: int, order: int, time_grid: str,
+                          grid_power: float | None) -> tuple:
+        """(ctx, f_list) of the H-expansion around param.H with this model's base settings."""
+        ctx, f_list, _ = self._build_h_independent_fields(
+            arg, maturity, time_steps, order + self._extra_order, self.param.H, self.base_solution, self.pade_order,
+            self.root_pade_degree, self.root_pade_series_order, self.root_pade_tail_match,
+            time_grid=time_grid, grid_power=grid_power, direct_riccati_solver=self.direct_riccati_solver,
+        )
+        return ctx, f_list[:order + 1]
+
+    def _log_hN(self, ctx: RiccatiContext, f_list: list, anchor_H: float, H: float) -> np.ndarray:
+        """log(phi_N / phi_0) on ctx's nodes: the H-expansion correction applied on top of phi_0."""
+        exp_n = self._compute_expansion_for_H(f_list, anchor_H, H)
+        return np.asarray(self._log_charfun_raw(ctx, exp_n, H) - self._log_charfun_raw(ctx, f_list[0], H))
 
     def log_charfun(
             self,
             arg: np.ndarray,
             maturity: float = 1.0,
             order: int = 0,
-            time_steps: int = 100,
+            time_steps: int = 400,
             H=None,
-            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "uniform",
+            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "graded",
             grid_power: float | None = None,
     ) -> np.ndarray:
         """Log characteristic function E[exp(i u log(S_T/S_0))].
@@ -790,11 +902,11 @@ class RoughHeston(object):
         order : int
             Taylor expansion order in H around the anchor ``self.param.H``.
         time_steps : int
-            Number of time-grid nodes.
+            Number of time-grid nodes.  With the exact-Heston base the log CF
+            at H = ½ is in closed form and does not use the grid.
         H : float, array-like, or None
             Target Hurst exponent(s).  ``None`` → ``self.param.H``.
-            Passing an array evaluates all H values in a single Volterra solve,
-            returning shape ``(N_u, N_H)``.  A scalar H returns shape ``(N_u,)``.
+            Passing an array evaluates all H values in a single Volterra solve.
         time_grid : {"uniform", "graded", "symmetric_graded"}
             Time discretisation; see :meth:`expansion_state`.
         grid_power : float or None
@@ -803,7 +915,8 @@ class RoughHeston(object):
         Returns
         -------
         np.ndarray
-            Shape ``(N_u,)`` for scalar H, ``(N_u, N_H)`` for array H.
+            Shape ``(N_u, N_H)``, one column per target H; ``N_H = 1`` for a
+            scalar or ``None`` H.
         """
         anchor_eff = self.param.H
         base_eff = self.base_solution
@@ -814,45 +927,43 @@ class RoughHeston(object):
 
         if H is None:
             H_arr = np.array([self.param.H])
-            scalar_H = True
         else:
             H_arr = np.atleast_1d(np.asarray(H, dtype=float))
-            scalar_H = False
 
-        if len(H_arr) > 1:
-            ctx, f_list = self._build_h_independent_fields(
-                arg, maturity, time_steps, order,
-                anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
-                time_grid=time_grid, grid_power=grid_power,
-                direct_riccati_solver=self.direct_riccati_solver,
-            )
-            cols = []
-            for H_i in H_arr:
-                exp_i = self._compute_expansion_for_H(f_list, anchor_eff, float(H_i))
-                kappa_i_ref = self._compute_kappa_path_reflected(ctx.grid, float(H_i))
-                log_phi_i = self._log_charfun_raw(ctx, exp_i, kappa_i_ref)
-                cols.append(np.asarray(log_phi_i).reshape(-1, 1))
-            return np.concatenate(cols, axis=1)  # (n_u, n_H)
-
-        # Scalar H — build state independently
+        key = None
+        if self._field_cache is not None:   # the accuracy check reprices with the same phi0
+            key = ("log_charfun", np.asarray(arg, dtype=np.complex128).tobytes(), maturity, order, time_steps,
+                   H_arr.tobytes(), time_grid, grid_power, self.log_cf_integrand)
+            if key in self._field_cache:
+                return self._field_cache[key]
+        ctx, f_list, ops = self._build_h_independent_fields(
+            arg, maturity, time_steps, order,
+            anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
+            time_grid=time_grid, grid_power=grid_power,
+            direct_riccati_solver=self.direct_riccati_solver,
+        )
         cols = []
         for H_i in H_arr:
-            state = self.expansion_state(
-                arg=arg, maturity=maturity, order=order, time_steps=time_steps,
-                H=float(H_i), time_grid=time_grid, grid_power=grid_power,
-            )
-            cols.append(np.asarray(self.log_charfun_from_field(state, state.expansion)).reshape(-1, 1))
-        log_phi = np.concatenate(cols, axis=1)  # (n_u, 1) or (n_u, n_H)
-        return log_phi
+            if ops.log_phi_anchor is not None and H_i == anchor_eff:
+                # At the anchor the expansion is f0, whose log CF the base knows in closed form.
+                log_phi_i = ops.log_phi_anchor
+            else:
+                exp_i = self._compute_expansion_for_H(f_list, anchor_eff, float(H_i))
+                log_phi_i = self._log_charfun_raw(ctx, exp_i, float(H_i))
+            cols.append(np.asarray(log_phi_i).reshape(-1, 1))
+        out = np.concatenate(cols, axis=1)  # (n_u, n_H)
+        if key is not None:
+            self._field_cache[key] = out
+        return out
 
     def charfun(
             self,
             arg: np.ndarray,
             maturity: float = 1.0,
             order: int = 0,
-            time_steps: int = 100,
+            time_steps: int = 400,
             H=None,
-            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "uniform",
+            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "graded",
             grid_power: float | None = None,
     ) -> np.ndarray:
         """Characteristic function.  See log_charfun for the H parameter."""
@@ -872,7 +983,7 @@ class RoughHeston(object):
             implied_vol: bool = False,
             payoff_selection: str = "otm",
             # --- fourier ---
-            R: float = 1.2,
+            R: float = 0.5,
             integration: Literal["panel", "adaptive_panel"] = "panel",
             L: float | None = None,
             panels=None,
@@ -881,7 +992,7 @@ class RoughHeston(object):
             time_steps_phi0: int | None = None,
             # --- expansion ---
             expansion_order: int = 0,
-            time_steps: int = 1000,
+            time_steps: int = 400,
             H=None,
             # --- adaptive ---
             adaptive_metric: Literal["price", "iv"] = "iv",
@@ -892,8 +1003,11 @@ class RoughHeston(object):
             adaptive_max_iter: int = 8,
             adaptive_verbose: bool = False,
             # --- time grid ---
-            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "uniform",
+            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "graded",
             grid_power: float | None = None,
+            # --- accuracy check ---
+            accuracy_check: bool = True,
+            accuracy_tol: float = 1e-4,
     ) -> np.ndarray:
         """Price European calls or puts via Fourier quadrature on the Heston measure.
 
@@ -906,23 +1020,35 @@ class RoughHeston(object):
         S_0 : float
             Initial spot price.
         call : bool
-            ``True`` for call, ``False`` for put.  Ignored when
-            ``payoff_selection="otm"`` (OTM payoff is chosen per strike).
+            ``True`` returns call prices, ``False`` put prices.  With
+            ``payoff_selection="otm"`` the out-of-the-money option is priced at
+            each strike and converted by put–call parity; implied vols do not
+            depend on ``call``.
         digital : bool
             Price digital (cash-or-nothing) payoffs instead of vanilla.
         implied_vol : bool
             If ``True``, return Black–Scholes implied volatilities instead of
-            option prices.
+            option prices.  Vanillas only.
         payoff_selection : {"otm", "as_requested"}
             ``"otm"`` prices calls for K ≥ F and puts for K < F, then applies
             put–call parity.  ``"as_requested"`` uses ``call`` for all strikes.
         R : float
-            Fourier contour height.  ``R = 0.5`` selects the Lewis contour
-            (no dampening factor, numerically recommended).  ``R > 0.5``
-            uses a damped-payoff contour.
+            Fourier contour height.  The default ``R = 0.5`` prices every
+            strike as a call and converts to puts by parity; for vanillas this
+            is the Lewis contour.  It needs only E[S_T^0.5], which is always
+            finite.  Other values use damped contours at ``+|R|`` for calls
+            and ``-|R|`` for puts, which need E[S_T^|R|] and E[S_T^-|R|] to be
+            finite.  Below ``|R| = 1`` vanilla calls get the residue S_0 of the
+            payoff's pole at 1 added, as in the Lewis formula (half of it at
+            1), and ``R = 0`` runs through the pole at 0, which adds half of
+            its residue.  Near a pole the integrand has a peak of width
+            |R - pole| at u = 0, which the panels resolve at 1e-2 from the
+            pole (prices off by 4e-9) but not at 1e-3 (up to 2e-3 S_0); on
+            the pole they are accurate.
         L : float or None
-            Upper truncation of the Fourier integral.  ``None`` auto-selects
-            from a maturity/moneyness heuristic.
+            Upper truncation of the Fourier integral.  ``None`` picks the point
+            where |phi| has decayed to about 1e-10, from the model parameters,
+            the maturity and every H priced (up to 256000).
         panels : array-like or None
             Explicit Chebyshev panel breakpoints.  Overrides ``L`` when given.
         m_cheb : int
@@ -931,7 +1057,8 @@ class RoughHeston(object):
             Number of nodes for the quadrature weight pre-computation.
         time_steps_phi0 : int or None
             Time-grid nodes for the order-0 (phi0) solve.  ``None`` falls
-            back to ``time_steps``.
+            back to ``time_steps``.  With the exact-Heston base, phi0 at
+            H = ½ is in closed form and does not use the grid.
         expansion_order : int
             Taylor expansion order N in H around ``self.param.H``.
         time_steps : int
@@ -945,22 +1072,41 @@ class RoughHeston(object):
             ``"panel"`` uses fixed panels.  ``"adaptive_panel"`` iteratively
             widens ``L`` until prices or implied vols stabilise.
         adaptive_metric : {"price", "iv"}
-            Convergence criterion for adaptive integration.
+            Convergence criterion for adaptive integration: the change of the
+            out-of-the-money prices or of their implied vols.  Digitals always
+            use ``"price"``.
         adaptive_tol : float
-            Relative tolerance for the adaptive stopping rule.
+            Tolerance of the ``"iv"`` criterion, in implied vol.
         adaptive_abs_tol, adaptive_rel_tol : float
-            Absolute and relative tolerances used alongside ``adaptive_tol``.
+            Absolute and relative tolerances of the ``"price"`` criterion.
         adaptive_L_candidates : list or None
-            Explicit sequence of ``L`` values to try; overrides the automatic
-            doubling schedule.
+            Explicit sequence of ``L`` values to try.  ``None`` starts at the
+            default ``L`` and widens through the panel-template endpoints.
         adaptive_max_iter : int
-            Maximum number of adaptive refinement iterations.
+            Maximum number of adaptive refinement iterations.  When no two
+            successive ``L`` agree, the prices at the last are returned with a
+            warning.
         adaptive_verbose : bool
             Print convergence information at each adaptive step.
         time_grid : {"uniform", "graded", "symmetric_graded"}
             Time-node distribution; see :meth:`expansion_state`.
         grid_power : float or None
             Grading exponent; ``None`` auto-selects.
+        accuracy_check : bool
+            If ``True`` (the default), estimate the approximation error and emit
+            a ``UserWarning`` when it exceeds ``accuracy_tol`` at some strike.
+            For ``expansion_order = N >= 1`` the estimate is the change of the
+            implied vols from order N to N+1 (the next term, computed along with
+            the main pass) at the lowest and the highest target H.  For the
+            Padé bases away from H₀ = ½ it is the difference between the two
+            ``log_cf_integrand`` formulas at the anchor, which is about the
+            error of ``"rhs"``; for root-Padé with ``"solution"``, which is
+            several times more accurate, a third of it.  The returned values do
+            not change.  Vanillas only; strikes whose out-of-the-money price is
+            below 1e-6 S_0 are skipped.  The check adds about 10–35 % run time;
+            pass ``False`` in loops that do not need it.
+        accuracy_tol : float
+            Warning threshold of the check, in implied volatility (1e-4 = 1 bp).
 
         Returns
         -------
@@ -976,10 +1122,14 @@ class RoughHeston(object):
             time_steps=time_steps, H=H,
             time_grid=time_grid, grid_power=grid_power,
         )
-        if integration == "panel":
-            result, *_ = self._eur_call_put_measure_quad_fixed_panel(**_pricing_kw)
-            return result
-        if integration == "adaptive_panel":
+        if integration not in ("panel", "adaptive_panel"):
+            raise ValueError(f"integration must be 'panel' or 'adaptive_panel', got {integration!r}")
+        if digital and implied_vol:
+            raise ValueError("implied_vol=True is for vanillas: the inversion uses the vanilla Black-Scholes price")
+
+        def price(**kw):
+            if integration == "panel":
+                return self._eur_call_put_measure_quad_fixed_panel(**kw)[0]
             return self._eur_call_put_measure_quad_adaptive_panel(
                 adaptive_metric=adaptive_metric,
                 adaptive_tol=adaptive_tol,
@@ -988,9 +1138,87 @@ class RoughHeston(object):
                 adaptive_L_candidates=adaptive_L_candidates,
                 adaptive_max_iter=adaptive_max_iter,
                 adaptive_verbose=adaptive_verbose,
-                **_pricing_kw,
+                **kw,
             )
-        raise ValueError(f"integration must be 'panel' or 'adaptive_panel', got {integration!r}")
+
+        if not accuracy_check or digital:
+            return price(**_pricing_kw)
+        # The checks reprice from the same expansion fields, so cache them for this call;
+        # the expansion check needs one order more, which the main pass computes along.
+        H_arr = np.atleast_1d(np.asarray(self.param.H if H is None else H, dtype=float))
+        check_expansion = expansion_order >= 1 and bool(np.any(np.abs(H_arr - self.param.H) > 1e-12))
+        self._field_cache = {}
+        self._extra_order = int(check_expansion)
+        try:
+            result = price(**_pricing_kw)
+            self._extra_order = 0
+            self._warn_if_inaccurate(price, _pricing_kw, result, accuracy_tol, check_expansion)
+        finally:
+            self._field_cache = None
+            self._extra_order = 0
+        return result
+
+    def _warn_if_inaccurate(self, price, kw: dict, result, tol: float, check_expansion: bool) -> None:
+        """Warn when a cheap a-posteriori error estimate exceeds ``tol`` (implied vol) at some strike.
+
+        The H-expansion: implied vols at orders N and N+1, since the next term
+        (H - H0)^(N+1)/(N+1)! f_(N+1) estimates the truncation error of order N; it grows with
+        |H - H0|, so the lowest and the highest target H bound it.  A Padé base: implied vols at
+        the anchor with the two log_cf_integrand formulas.  Both are exact for the exact h, and
+        "rhs" amplifies the error of an approximate h by about nu|u|, so they differ by about the
+        error of "rhs".  Root-Padé with "solution" is typically 3-10 times more accurate than that
+        difference, so a third of it is used there.  Strikes whose out-of-the-money price is below
+        1e-6 S_0 are skipped.
+        """
+        from roughprix.fourier import _bs_price
+
+        N = kw["expansion_order"]
+        H_arr = np.atleast_1d(np.asarray(self.param.H if kw["H"] is None else kw["H"], dtype=float))
+        iv_kw = dict(kw, implied_vol=True)
+        main_iv = result if kw["implied_vol"] else None
+        form = self.log_cf_integrand
+        checks = []   # (pricing kw, its implied vols if known, the same with what changes, its form,
+        #               share of the difference that estimates the error, what, advice)
+        if check_expansion:
+            # The next term grows like |H - H0|^(N+1), so the extreme targets are enough.  The
+            # default Fourier cutoff depends only on them (the decay rate it uses is log-concave
+            # in H), so these passes run on the main pass's nodes and reuse its cached fields.
+            ext = [int(np.argmin(H_arr)), int(np.argmax(H_arr))]
+            sub = H_arr.size > 2
+            kw_a = dict(iv_kw, H=H_arr[ext]) if sub else iv_kw
+            iv_a = np.asarray(main_iv)[:, ext] if sub and main_iv is not None else main_iv
+            checks.append((kw_a, iv_a, dict(kw_a, expansion_order=N + 1), form, 1.0,
+                           f"H-expansion, orders {N} and {N + 1}",
+                           "raise expansion_order or anchor closer to the target H"))
+        if self.base_solution in ("root_pade", "pade") and abs(self.param.H - 0.5) > 1e-10:
+            at_main = N == 0 and H_arr.size == 1 and abs(H_arr[0] - self.param.H) < 1e-12
+            kw_a = iv_kw if at_main else dict(iv_kw, H=None, expansion_order=0)
+            share = 1 / 3 if self.base_solution == "root_pade" and form != "rhs" else 1.0
+            checks.append((kw_a, main_iv if at_main else None, kw_a, "solution" if form == "rhs" else "rhs", share,
+                           f"{self.base_solution} base at H = {self.param.H:g}, from the two log_cf_integrand formulas",
+                           "base_solution='direct_riccati' is accurate"))
+        K = np.asarray(kw["K"], dtype=float).reshape(-1)
+        T, S_0 = kw["maturity"], kw["S_0"]
+        F = S_0 * np.exp(self.riskfree * T)
+        for kw_a, iv_a, kw_b, form_b, share, what, advice in checks:
+            iv = np.asarray(price(**kw_a) if iv_a is None else iv_a, dtype=float)
+            self.log_cf_integrand = form_b
+            try:
+                alt = np.asarray(price(**kw_b), dtype=float)
+            finally:
+                self.log_cf_integrand = form
+            vol = np.where(np.isfinite(iv), iv, alt)   # where one pass failed, the other sets the price level
+            Kb = K[:, None] if vol.ndim == 2 else K
+            with np.errstate(invalid="ignore"):
+                otm = np.where(Kb >= F, _bs_price(S_0, Kb, vol, T, self.riskfree, call=True),
+                               _bs_price(S_0, Kb, vol, T, self.riskfree, call=False))
+            diff = np.abs(alt - iv)[otm >= 1e-6 * S_0]
+            est = share * np.max(np.where(np.isfinite(diff), diff, np.inf), initial=0.0)
+            if est > tol:
+                size = (f"up to {est * 1e4:.1f} bp in implied vol" if np.isfinite(est)
+                        else "unbounded: non-finite implied vols")
+                warnings.warn(f"{what}: estimated error {size} (accuracy_tol {tol * 1e4:.1f} bp); {advice}.",
+                              stacklevel=3)
 
     def _eur_call_put_measure_quad_fixed_panel(
             self,
@@ -1003,7 +1231,7 @@ class RoughHeston(object):
             implied_vol: bool = False,
             payoff_selection: str = "otm",
             # --- fourier ---
-            R: float = 1.2,
+            R: float = 0.5,
             L: float | None = None,
             panels=None,
             m_cheb: int = 16,
@@ -1011,13 +1239,13 @@ class RoughHeston(object):
             time_steps_phi0: int | None = None,
             # --- expansion ---
             expansion_order: int = 0,
-            time_steps: int = 1000,
+            time_steps: int = 400,
             H=None,
             # --- incremental cache (supplied by adaptive loop) ---
             _phi0_cache: dict | None = None,
             _log_hN_cache: dict | None = None,
             # --- time grid ---
-            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "uniform",
+            time_grid: Literal["uniform", "graded", "symmetric_graded"] = "graded",
             grid_power: float | None = None,
     ) -> tuple:
         from .base_solution import (
@@ -1026,7 +1254,7 @@ class RoughHeston(object):
         )
         from roughprix.fourier import (
             _iv_eur, build_panel_quadrature,
-            measure_weights_from_phi, eur_call_put_from_weights,
+            measure_weights_from_phi, eur_call_put_from_weights, damped_contour_residues,
             lewis_weights_from_phi, eur_call_from_lewis_weights,
         )
 
@@ -1048,26 +1276,27 @@ class RoughHeston(object):
         else:
             H_arr = np.atleast_1d(np.asarray(H, dtype=float))
 
+        # R = 0.5 prices every strike as a call and gets puts by parity: on the
+        # Lewis contour for vanillas, on the damped contour +0.5 for digitals.
         lewis_mode = (not digital) and np.isclose(R, 0.5)
-        if digital and np.isclose(R, 0.5):
-            raise ValueError("Lewis contour (R=0.5) is not supported for digital options.")
+        digital_parity = digital and np.isclose(R, 0.5)
 
         K = np.asarray(K, dtype=float).reshape(-1)
         D = np.exp(-self.riskfree * maturity)
         F = S_0 / D
 
-        kmax = None
         if panels is None:
             if L is None:
-                kmax = float(np.max(np.abs(np.log(K / F))))
-                L = _heuristic_measure_L(maturity, kmax)
+                L = _heuristic_measure_L(maturity, self.param, np.append(H_arr, self.param.H))
             panels_resolved = _heuristic_measure_panels(L)
         else:
             panels_resolved = _as_strict_panels(panels, L=L)
             L = float(panels_resolved[-1])
 
-        if lewis_mode:
-            # Lewis always prices all strikes on a single contour as calls.
+        if payoff_selection not in ("as_requested", "otm"):
+            raise ValueError("payoff_selection must be 'as_requested' or 'otm'")
+        if lewis_mode or digital_parity:
+            # Price all strikes on a single contour as calls.
             call_mask = np.ones(len(K), dtype=bool)
             put_mask = np.zeros(len(K), dtype=bool)
             masks = [(call_mask, True)]
@@ -1075,7 +1304,7 @@ class RoughHeston(object):
             call_mask = np.ones(len(K), dtype=bool)
             put_mask = np.zeros(len(K), dtype=bool)
             masks = [(call_mask, call)]
-        elif payoff_selection == "otm":
+        else:  # "otm"
             put_mask = K < F
             call_mask = ~put_mask
             masks = []
@@ -1083,51 +1312,35 @@ class RoughHeston(object):
                 masks.append((call_mask, True))
             if np.any(put_mask):
                 masks.append((put_mask, False))
-        else:
-            raise ValueError("payoff_selection must be 'as_requested' or 'otm'")
 
         quad = build_panel_quadrature(panels_resolved, m_cheb, q_weight)
 
-        # For multiple H: precompute H-independent fields per R-sign (or Lewis contour).
-        _phi0_fields: dict = {}  # R_sub / "lewis" -> (ctx_q, f0_q)
+        # For multiple H: precompute log phi0 for every H and the H-independent hN
+        # fields per R-sign (or Lewis contour).
+        _log_phi0: dict = {}  # R_sub / "lewis" -> log phi0 at u_quad, one column per H
         _hN_fields: dict = {}  # R_sub / "lewis" -> (ctx_n, f_list_n)
         if len(H_arr) > 1:
             if lewis_mode:
-                ctx_q, f_list_q = self._build_h_independent_fields(
-                    quad.u_quad - 0.5j, maturity, time_steps_phi0, 0,
-                    anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
+                _log_phi0["lewis"] = self.log_charfun(
+                    quad.u_quad - 0.5j, maturity=maturity, order=0,
+                    time_steps=time_steps_phi0, H=H_arr,
                     time_grid=time_grid, grid_power=grid_power,
-                    direct_riccati_solver=self.direct_riccati_solver,
                 )
-                _phi0_fields["lewis"] = (ctx_q, f_list_q)
-                ctx_n, f_list_n = self._build_h_independent_fields(
-                    quad.u_nodes - 0.5j, maturity, time_steps, expansion_order,
-                    anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
-                    time_grid=time_grid, grid_power=grid_power,
-                    direct_riccati_solver=self.direct_riccati_solver,
-                )
-                _hN_fields["lewis"] = (ctx_n, f_list_n)
+                _hN_fields["lewis"] = self._expansion_fields(
+                    quad.u_nodes - 0.5j, maturity, time_steps, expansion_order, time_grid, grid_power)
             else:
                 for mask, subset_call in masks:
                     R_sub = abs(R) if subset_call else -abs(R)
-                    if R_sub not in _phi0_fields:
-                        arg_q = -1j * (R_sub - 1j * quad.u_quad)
-                        ctx_q, f_list_q = self._build_h_independent_fields(
-                            arg_q, maturity, time_steps_phi0, 0,
-                            anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
+                    if R_sub not in _log_phi0:
+                        _log_phi0[R_sub] = self.log_charfun(
+                            -1j * (R_sub - 1j * quad.u_quad), maturity=maturity, order=0,
+                            time_steps=time_steps_phi0, H=H_arr,
                             time_grid=time_grid, grid_power=grid_power,
-                            direct_riccati_solver=self.direct_riccati_solver,
                         )
-                        _phi0_fields[R_sub] = (ctx_q, f_list_q)
                     if R_sub not in _hN_fields:
-                        arg_n = -1j * (R_sub - 1j * quad.u_nodes)
-                        ctx_n, f_list_n = self._build_h_independent_fields(
-                            arg_n, maturity, time_steps, expansion_order,
-                            anchor_eff, base_eff, po_eff, rpd_eff, rpso_eff, rptm_eff,
-                            time_grid=time_grid, grid_power=grid_power,
-                            direct_riccati_solver=self.direct_riccati_solver,
-                        )
-                        _hN_fields[R_sub] = (ctx_n, f_list_n)
+                        _hN_fields[R_sub] = self._expansion_fields(
+                            -1j * (R_sub - 1j * quad.u_nodes), maturity, time_steps, expansion_order,
+                            time_grid, grid_power)
 
         # ----------------------------------------------------------------
         # Evaluate for each H value
@@ -1135,7 +1348,7 @@ class RoughHeston(object):
         all_prices = []
         all_raw_otm_prices = []
 
-        for H_i in H_arr:
+        for i_H, H_i in enumerate(H_arr):
             H_i = float(H_i)
             otm_prices_i = np.zeros(len(K))
             otm_is_call_i = np.full(len(K), call)
@@ -1147,30 +1360,21 @@ class RoughHeston(object):
                     if _phi0_cache is not None and _lewis_key in _phi0_cache:
                         phi0_lewis = _phi0_cache[_lewis_key]
                     else:
-                        state_q = self.expansion_state(
+                        log_phi0 = self.log_charfun(
                             quad.u_quad - 0.5j, maturity=maturity, order=0,
                             time_steps=time_steps_phi0, H=H_i,
                             time_grid=time_grid, grid_power=grid_power,
                         )
-                        phi0_lewis = jnp.exp(jnp.asarray(
-                            self.log_charfun_from_field(state_q, state_q.f0),
-                            dtype=jnp.complex128,
-                        ))
+                        phi0_lewis = jnp.exp(jnp.asarray(log_phi0[:, 0], dtype=jnp.complex128))
 
                     if expansion_order == 0:
                         log_hN_lewis = np.zeros(len(quad.u_nodes))
                     elif _log_hN_cache is not None and _lewis_key in _log_hN_cache:
                         log_hN_lewis = _log_hN_cache[_lewis_key]
                     else:
-                        state_n = self.expansion_state(
-                            quad.u_nodes - 0.5j, maturity=maturity, order=expansion_order,
-                            time_steps=time_steps, H=H_i,
-                            time_grid=time_grid, grid_power=grid_power,
-                        )
-                        log_hN_lewis = np.asarray(
-                            self.log_charfun_from_field(state_n, state_n.expansion)
-                            - self.log_charfun_from_field(state_n, state_n.f0)
-                        )
+                        ctx_n, f_list_n = self._expansion_fields(
+                            quad.u_nodes - 0.5j, maturity, time_steps, expansion_order, time_grid, grid_power)
+                        log_hN_lewis = self._log_hN(ctx_n, f_list_n, anchor_eff, H_i)
                 else:
                     # --------------------------------------------------------
                     # Scalar H: pre-compute phi0 and log_hN for all R_subs
@@ -1178,7 +1382,7 @@ class RoughHeston(object):
                     #
                     # Optimisations:
                     #   • order=0  → hN=1 exactly; skip all hN evaluation.
-                    #   • All R_subs batched into one expansion_state for phi0.
+                    #   • All R_subs batched into one log_charfun call for phi0.
                     #   • order>0  → all R_subs batched into one expansion_state
                     #                for hN (separate call, different order).
                     # --------------------------------------------------------
@@ -1209,12 +1413,11 @@ class RoughHeston(object):
                         arg_b = np.concatenate(
                             [-1j * (Rs - 1j * quad.u_quad) for Rs in R_need_phi0]
                         )
-                        state_b = self.expansion_state(
+                        lp0 = self.log_charfun(
                             arg_b, maturity=maturity, order=0,
                             time_steps=time_steps_phi0, H=H_i,
                             time_grid=time_grid, grid_power=grid_power,
-                        )
-                        lp0 = np.asarray(self.log_charfun_from_field(state_b, state_b.f0))
+                        )[:, 0]
                         for i_r, R_sub in enumerate(R_need_phi0):
                             phi0_per_R[R_sub] = jnp.exp(jnp.asarray(
                                 lp0[i_r * n_q:(i_r + 1) * n_q], dtype=jnp.complex128,
@@ -1226,18 +1429,11 @@ class RoughHeston(object):
                         arg_b = np.concatenate(
                             [-1j * (Rs - 1j * quad.u_nodes) for Rs in R_need_hN]
                         )
-                        state_b = self.expansion_state(
-                            arg_b, maturity=maturity, order=expansion_order,
-                            time_steps=time_steps, H=H_i,
-                            time_grid=time_grid, grid_power=grid_power,
-                        )
-                        lp0 = np.asarray(self.log_charfun_from_field(state_b, state_b.f0))
-                        lpN = np.asarray(self.log_charfun_from_field(state_b, state_b.expansion))
+                        ctx_b, f_list_b = self._expansion_fields(
+                            arg_b, maturity, time_steps, expansion_order, time_grid, grid_power)
+                        log_hN_b = self._log_hN(ctx_b, f_list_b, anchor_eff, H_i)
                         for i_r, R_sub in enumerate(R_need_hN):
-                            log_hN_per_R[R_sub] = np.asarray(
-                                lpN[i_r * n_n:(i_r + 1) * n_n]
-                                - lp0[i_r * n_n:(i_r + 1) * n_n]
-                            )
+                            log_hN_per_R[R_sub] = log_hN_b[i_r * n_n:(i_r + 1) * n_n]
 
             # ---- Per-mask computation -----------------------------------
             _hN_cache_i: dict = {}  # used only by the multi-H path
@@ -1248,10 +1444,7 @@ class RoughHeston(object):
                 if lewis_mode:
                     # --- Lewis: single contour, all strikes as calls ---
                     if len(H_arr) > 1:
-                        ctx_q, f_list_q = _phi0_fields["lewis"]
-                        kappa_q_ref = self._compute_kappa_path_reflected(ctx_q.grid, H_i)
-                        log_phi0 = self._log_charfun_raw(ctx_q, f_list_q[0], kappa_q_ref)
-                        phi0_sub = jnp.exp(jnp.asarray(log_phi0, dtype=jnp.complex128))
+                        phi0_sub = jnp.exp(jnp.asarray(_log_phi0["lewis"][:, i_H], dtype=jnp.complex128))
                     else:
                         phi0_sub = phi0_lewis
 
@@ -1260,12 +1453,7 @@ class RoughHeston(object):
                     if len(H_arr) > 1:
                         cache_key = ("lewis", quad.u_nodes.tobytes())
                         if cache_key not in _hN_cache_i:
-                            ctx_n, f_list_n = _hN_fields["lewis"]
-                            kappa_n_ref = self._compute_kappa_path_reflected(ctx_n.grid, H_i)
-                            exp_n = self._compute_expansion_for_H(f_list_n, anchor_eff, H_i)
-                            log_phiN_n = self._log_charfun_raw(ctx_n, exp_n, kappa_n_ref)
-                            log_phi0_n = self._log_charfun_raw(ctx_n, f_list_n[0], kappa_n_ref)
-                            log_hN_sub = np.asarray(log_phiN_n - log_phi0_n)
+                            log_hN_sub = self._log_hN(*_hN_fields["lewis"], anchor_eff, H_i)
                             hN_sub = np.exp(log_hN_sub)
                             _hN_cache_i[cache_key] = (log_hN_sub, hN_sub)
                         else:
@@ -1285,27 +1473,19 @@ class RoughHeston(object):
 
                     # --- phi0 ---
                     if len(H_arr) > 1:
-                        ctx_q, f_list_q = _phi0_fields[R_sub]
-                        kappa_q_ref = self._compute_kappa_path_reflected(ctx_q.grid, H_i)
-                        log_phi0 = self._log_charfun_raw(ctx_q, f_list_q[0], kappa_q_ref)
-                        phi0_sub = jnp.exp(jnp.asarray(log_phi0, dtype=jnp.complex128))
+                        phi0_sub = jnp.exp(jnp.asarray(_log_phi0[R_sub][:, i_H], dtype=jnp.complex128))
                     else:
                         phi0_sub = phi0_per_R[R_sub]
 
                     w_jnp = measure_weights_from_phi(
-                        phi0_sub, quad, K_sub, R_sub, call=subset_call, digital=digital,
+                        phi0_sub, quad, K_sub, R_sub, call=subset_call, digital=digital, S_0=S_0,
                     )
 
                     # --- log_hN ---
                     if len(H_arr) > 1:
                         cache_key = (float(R_sub), quad.u_nodes.tobytes())
                         if cache_key not in _hN_cache_i:
-                            ctx_n, f_list_n = _hN_fields[R_sub]
-                            kappa_n_ref = self._compute_kappa_path_reflected(ctx_n.grid, H_i)
-                            exp_n = self._compute_expansion_for_H(f_list_n, anchor_eff, H_i)
-                            log_phiN_n = self._log_charfun_raw(ctx_n, exp_n, kappa_n_ref)
-                            log_phi0_n = self._log_charfun_raw(ctx_n, f_list_n[0], kappa_n_ref)
-                            log_hN_sub = np.asarray(log_phiN_n - log_phi0_n)
+                            log_hN_sub = self._log_hN(*_hN_fields[R_sub], anchor_eff, H_i)
                             hN_sub = np.exp(log_hN_sub)
                             _hN_cache_i[cache_key] = (log_hN_sub, hN_sub)
                         else:
@@ -1316,26 +1496,41 @@ class RoughHeston(object):
 
                     sub_prices = np.asarray(
                         eur_call_put_from_weights(w_jnp, jnp.asarray(hN_sub), D)
-                    )
+                    ) + damped_contour_residues(K_sub, R_sub, S_0, D, call=subset_call, digital=digital)
                     otm_prices_i[mask] = sub_prices
                     otm_is_call_i[mask] = subset_call
 
             # capture raw OTM prices before parity correction and IV inversion
             all_raw_otm_prices.append(otm_prices_i.copy())
 
-            if lewis_mode and payoff_selection == "as_requested" and not call:
-                # Lewis always prices calls; convert to puts via parity when user wants puts.
-                prices_i = otm_prices_i - S_0 + K * D
+            # Put-call parity: C - P = S_0 - K D for vanillas, C + P = D for
+            # (cash-or-nothing) digitals.
+            if digital:
+                def _put_to_call(p, k):
+                    return D - p
+
+                def _call_to_put(c, k):
+                    return D - c
+            else:
+                def _put_to_call(p, k):
+                    return p + S_0 - k * D
+
+                def _call_to_put(c, k):
+                    return c - S_0 + k * D
+
+            if (lewis_mode or digital_parity) and payoff_selection == "as_requested" and not call:
+                # All strikes were priced as calls; convert to the requested puts.
+                prices_i = _call_to_put(otm_prices_i, K)
             elif payoff_selection == "as_requested":
                 prices_i = otm_prices_i
             else:
                 prices_i = np.empty_like(K)
                 if call:
                     prices_i[call_mask] = otm_prices_i[call_mask]
-                    prices_i[put_mask] = otm_prices_i[put_mask] + S_0 - K[put_mask] * D
+                    prices_i[put_mask] = _put_to_call(otm_prices_i[put_mask], K[put_mask])
                 else:
                     prices_i[put_mask] = otm_prices_i[put_mask]
-                    prices_i[call_mask] = otm_prices_i[call_mask] - S_0 + K[call_mask] * D
+                    prices_i[call_mask] = _call_to_put(otm_prices_i[call_mask], K[call_mask])
 
             if implied_vol:
                 if payoff_selection == "as_requested":
@@ -1394,12 +1589,12 @@ class RoughHeston(object):
         call = pricing_kw.get("call", True)
         digital = pricing_kw.get("digital", False)
         payoff_selection = pricing_kw.get("payoff_selection", "otm")
-        R = pricing_kw.get("R", 1.2)
+        R = pricing_kw.get("R", 0.5)
         implied_vol = pricing_kw.get("implied_vol", False)
         expansion_order = pricing_kw.get("expansion_order", 0)
-        time_steps = pricing_kw.get("time_steps", 1000)
+        time_steps = pricing_kw.get("time_steps", 400)
         time_steps_phi0 = pricing_kw.get("time_steps_phi0")
-        time_grid = pricing_kw.get("time_grid", "uniform")
+        time_grid = pricing_kw.get("time_grid", "graded")
         grid_power = pricing_kw.get("grid_power")
         H = pricing_kw.get("H")
 
@@ -1408,6 +1603,8 @@ class RoughHeston(object):
                 "adaptive_panel expects panels=None; explicit panels imply a fixed grid. "
                 "Use integration='panel' to pass explicit panels."
             )
+        if digital:   # digital prices have no vanilla implied vol to compare
+            adaptive_metric = "price"
 
         K_arr = np.asarray(K, dtype=float).reshape(-1)
         D = np.exp(-self.riskfree * maturity)
@@ -1424,12 +1621,13 @@ class RoughHeston(object):
         ts_phi0_eff = time_steps if time_steps_phi0 is None else time_steps_phi0
 
         lewis_mode = (not digital) and np.isclose(R, 0.5)
-        if digital and np.isclose(R, 0.5):
-            raise ValueError("Lewis contour (R=0.5) is not supported for digital options.")
+        digital_parity = digital and np.isclose(R, 0.5)
 
         # Pre-determine which contours will be used (mirrors mask logic in fixed-panel helper).
         if lewis_mode:
             R_subs = ["lewis"]
+        elif digital_parity:
+            R_subs = [abs(R)]
         elif payoff_selection == "as_requested":
             R_subs = [abs(R) if call else -abs(R)]
         else:
@@ -1438,18 +1636,22 @@ class RoughHeston(object):
                 R_subs.append(abs(R))
             if np.any(K_arr < F):
                 R_subs.append(-abs(R))
+            R_subs = list(dict.fromkeys(R_subs))  # R = 0: one contour, as 0.0 == -0.0
 
         # Build L candidates — must be exact _MEASURE_PANEL_TEMPLATE endpoints to ensure
         # consecutive grids are nested (prefix property required by incremental cache).
         if adaptive_L_candidates is None:
-            kmax = float(np.max(np.abs(np.log(K_arr / F))))
-            adaptive_L_candidates_used = _nested_measure_L_candidates(maturity, kmax)
+            adaptive_L_candidates_used = _nested_measure_L_candidates(
+                maturity, self.param, np.append(H_arr_eff, self.param.H)
+            )
         else:
             adaptive_L_candidates_used = _validate_nested_measure_L_candidates(
                 adaptive_L_candidates
             )
 
         L_seq = adaptive_L_candidates_used[:adaptive_max_iter]
+        if not L_seq:
+            raise ValueError("adaptive_panel needs at least one L candidate and adaptive_max_iter >= 1")
 
         # Incremental log-value cache: (H_i, R_sub) → concatenated log arrays
         _phi0_log_cache: dict = {}
@@ -1496,14 +1698,11 @@ class RoughHeston(object):
                                 arg_new = u_quad_new - 0.5j
                             else:
                                 arg_new = -1j * (R_sub - 1j * u_quad_new)
-                            state_new = self.expansion_state(
+                            log_phi0_new = self.log_charfun(
                                 arg_new, maturity=maturity, order=0,
                                 time_steps=ts_phi0_eff, H=H_i,
                                 time_grid=time_grid, grid_power=grid_power,
-                            )
-                            log_phi0_new = np.asarray(
-                                self.log_charfun_from_field(state_new, state_new.f0)
-                            )
+                            )[:, 0]
                             if key in _phi0_log_cache:
                                 log_phi0_full = np.concatenate([_phi0_log_cache[key], log_phi0_new])
                             else:
@@ -1519,15 +1718,9 @@ class RoughHeston(object):
                                 arg_n_new = u_nodes_new - 0.5j
                             else:
                                 arg_n_new = -1j * (R_sub - 1j * u_nodes_new)
-                            state_n_new = self.expansion_state(
-                                arg_n_new, maturity=maturity,
-                                order=expansion_order, time_steps=time_steps,
-                                H=H_i, time_grid=time_grid, grid_power=grid_power,
-                            )
-                            log_hN_new = np.asarray(
-                                self.log_charfun_from_field(state_n_new, state_n_new.expansion)
-                                - self.log_charfun_from_field(state_n_new, state_n_new.f0)
-                            )
+                            log_hN_new = self._log_hN(*self._expansion_fields(
+                                arg_n_new, maturity, time_steps, expansion_order, time_grid, grid_power,
+                            ), self.param.H, H_i)
                             if key in _log_hN_log_cache:
                                 log_hN_full = np.concatenate([_log_hN_log_cache[key], log_hN_new])
                             else:
@@ -1569,4 +1762,10 @@ class RoughHeston(object):
             prev_check = check
             last_result = result_try
 
+        warnings.warn(
+            f"adaptive_panel did not converge: no two successive L up to {L_seq[-1]:g} agreed within "
+            f"the tolerance; returning the prices at L = {L_seq[-1]:g} (adaptive_verbose=True shows "
+            "the differences).",
+            stacklevel=4,
+        )
         return last_result

@@ -24,13 +24,18 @@ caller produces phi_0 and hN via ``model.expansion_state`` together with
 
 Two contour paths are provided:
 
-Damped-measure path (arbitrary R > 0):
+Damped-measure path (any real R):
     Contour: u + iR, dampening factor exp(-R * log K) absorbed into the
-    payoff transform.  Standard choice R = 1.2.
+    payoff transform.  Needs E[S_T^R] to be finite.  The integral is the
+    price for R > 1 (vanilla calls), R > 0 (digital calls) or R < 0
+    (puts); on other contours step 4 adds the payoff poles in between.
+    RoughHeston prices digitals on R = 0.5 by default, which needs only
+    E[S_T^0.5].
 
     1. build_panel_quadrature    — build Chebyshev–GL panel nodes once
-    2. measure_weights_from_phi  — W[k,j] = ∫ payoff_hat(K_k, u+iR) phi_0(u+iR) ℓ_j(u) du
+    2. measure_weights_from_phi  — W[k,j] = ∫ payoff_hat(K_k, u+iR) S^-i(u+iR) phi_0(u+iR) ℓ_j(u) du
     3. eur_call_put_from_weights — price[k] = (disc/π) Re(W[k,:] @ hN)
+    4. damped_contour_residues   — + the residues of the poles at R = 0 and R = 1
 
 Lewis contour path (R = 0.5, calls only):
     Contour: u - i/2.  No dampening factor; numerically recommended.
@@ -47,6 +52,7 @@ __all__ = [
     "fourier_payoff_call_put",
     "measure_weights_from_phi",
     "eur_call_put_from_weights",
+    "damped_contour_residues",
     "lewis_weights_from_phi",
     "eur_call_from_lewis_weights",
     "otm_prices_to_ivs",
@@ -55,6 +61,7 @@ __all__ = [
 ]
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 import jax.numpy as jnp
@@ -75,15 +82,37 @@ def _bs_price(S_0, K, sigma, T, r=0., call=True):
     return -S_0 * norm.cdf(-d1) + K * np.exp(-r * T) * norm.cdf(-d2)
 
 
-def _iv_bisect(price_fun, price, tol=1e-10, sl=1e-10, sr=10.):
-    threshold = sl + tol
+def _iv_bisect(price_fun, price, tol=1e-10, sl=1e-10, sr=10., max_iter=100):
+    """Vectorised bisection for the implied vol on the bracket ``[sl, sr]``.
+
+    ``price_fun(sigma)`` must be increasing in ``sigma``.  The result is NaN
+    where ``price`` is not finite, where ``price_fun`` is not finite, and where
+    the implied vol is not strictly inside the bracket.  The last case covers
+    prices outside the no-arbitrage bounds: at or below intrinsic value the
+    bisection collapses onto ``sl``, and at or above ``price_fun(sr)`` it
+    collapses onto ``sr``.
+
+    The loop runs at most ``max_iter`` times, so it always terminates.  The
+    default bracket reaches ``tol`` after 37 halvings.
+    """
+    price = np.asarray(price, dtype=float)
+    finite = np.isfinite(price)
+    # A NaN price compares false against everything, which would freeze its
+    # bracket.  Bisect a placeholder for every non-finite price and mask it at
+    # the end.
+    price = np.where(finite, price, 0.0)
+    lo, hi = sl, sr
     sm = (sl + sr) / 2
-    while np.amax(sr - sl) > tol:
+    for _ in range(max_iter):
+        if np.amax(sr - sl) <= tol:
+            break
         em = price_fun(sm) - price
         sl = np.where(em < 0, sm, sl)
         sr = np.where(em >= 0, sm, sr)
         sm = (sl + sr) / 2
-    return np.where(sm < threshold, np.nan, sm)
+    # A NaN from price_fun also freezes the bracket, so it fails the width test.
+    ok = finite & (sr - sl <= tol) & (sm >= lo + tol) & (sm <= hi - tol)
+    return np.where(ok, sm, np.nan)
 
 
 def _iv_eur(S_0, K, T, price, payoff, r=0.):
@@ -198,6 +227,19 @@ class PanelQuadrature:
     panel_data: list = field(default_factory=list)
 
 
+@lru_cache(maxsize=None)
+def _gauss_legendre(q_weight: int) -> tuple[np.ndarray, np.ndarray]:
+    """Gauss-Legendre nodes and weights of order q_weight on [-1, 1], as read-only arrays.
+
+    numpy's leggauss finds the nodes as the eigenvalues of the symmetric companion matrix of
+    the Legendre polynomial P_q; this eigenvalue problem is solved once per order.
+    """
+    xg, wg = np.polynomial.legendre.leggauss(q_weight)
+    xg.flags.writeable = False
+    wg.flags.writeable = False
+    return xg, wg
+
+
 def build_panel_quadrature(
     panels: np.ndarray,
     m_cheb: int,
@@ -205,7 +247,7 @@ def build_panel_quadrature(
 ) -> PanelQuadrature:
     """Build Chebyshev–Gauss-Legendre panel quadrature for the Fourier integral."""
     panels = _as_strict_panels(np.asarray(panels, dtype=float))
-    xg, wg = np.polynomial.legendre.leggauss(q_weight)
+    xg, wg = _gauss_legendre(q_weight)
 
     all_u_nodes, all_u_quad, all_w_quad, Lmat_blocks, panel_data = [], [], [], [], []
 
@@ -255,15 +297,17 @@ def measure_weights_from_phi(
     R: float,
     call: bool = True,
     digital: bool = False,
+    S_0: float = 1.0,
 ) -> jnp.ndarray:
-    """Compute interpolation weights W[k, j] = ∫ payoff_hat(K_k, u) phi0(u) ell_j(u) du.
+    """Compute interpolation weights W[k, j] = ∫ payoff_hat(K_k, u) S_0^(-iu) phi0(u) ell_j(u) du.
 
     Args:
-        phi0:  complex JAX array (N_q,) — base char function at quad.u_quad
+        phi0:  complex JAX array (N_q,) — base char function of log(S_T/S_0) at quad.u_quad
         quad:  PanelQuadrature from build_panel_quadrature
         K:     strike array (N_K,)
         R:     dampening shift (real)
         call / digital: payoff variant
+        S_0:   spot price
 
     Returns:
         complex JAX array (N_K, N_u)
@@ -274,7 +318,8 @@ def measure_weights_from_phi(
     u_c    = jnp.asarray(quad.u_quad + 1j * R, dtype=jnp.complex128)
 
     payoff_hat = fourier_payoff_call_put(K, u_c, call=call, digital=digital)  # (N_K, N_q)
-    B = payoff_hat * phi0[None, :]                                             # (N_K, N_q)
+    phi_S = jnp.exp(-1j * np.log(S_0) * u_c) * phi0                            # CF of log S_T
+    B = payoff_hat * phi_S[None, :]                                            # (N_K, N_q)
     return (B * w_quad[None, :]) @ Lmat                                        # (N_K, N_u)
 
 
@@ -300,6 +345,42 @@ def eur_call_put_from_weights(
         real JAX array (N_K,)
     """
     return (discount / np.pi) * jnp.real(weights @ hN)
+
+
+def damped_contour_residues(
+    K: np.ndarray,
+    R: float,
+    S_0: float,
+    discount: float,
+    call: bool = True,
+    digital: bool = False,
+) -> np.ndarray:
+    """Pole terms that turn eur_call_put_from_weights into the price on any contour.
+
+    The integral is the price itself when R lies in the payoff's strip: R > 1 for
+    vanilla calls, R > 0 for digital calls, R < 0 for puts.  Each pole of the payoff
+    transform between R and that strip adds its residue, half of it when the contour
+    runs through the pole: S_0 at R = 1 (vanillas), and K * discount (vanillas) or
+    discount (digitals) at R = 0.  For calls on R = 0.5 this is the Lewis formula,
+    C = S_0 + integral.
+
+    Args:
+        K:        strike array (N_K,)
+        R:        contour height, as passed to measure_weights_from_phi
+        S_0:      spot price
+        discount: exp(-r * T)
+        call / digital: payoff variant
+
+    Returns:
+        real numpy array (N_K,)
+    """
+    K = np.asarray(K, dtype=float).reshape(-1)
+    # np.heaviside(x, 0.5): 1 above 0, 1/2 on the pole, 0 below
+    if digital:
+        return np.full(K.shape, discount * np.heaviside(-R if call else R, 0.5))
+    if call:
+        return S_0 * np.heaviside(1 - R, 0.5) - K * discount * np.heaviside(-R, 0.5)
+    return K * discount * np.heaviside(R, 0.5) - S_0 * np.heaviside(R - 1, 0.5)
 
 
 # ---------------------------------------------------------------------------

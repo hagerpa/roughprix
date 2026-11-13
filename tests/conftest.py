@@ -3,7 +3,7 @@ import pytest
 
 def pytest_addoption(parser):
     parser.addoption("--run-slow", action="store_true", default=False,
-                     help="Run slow benchmark tests (time_steps=1000, order=6)")
+                     help="Run slow tests (benchmarks at time_steps=1000, order=6; all reference smiles)")
 
 
 def pytest_configure(config):

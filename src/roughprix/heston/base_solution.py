@@ -6,6 +6,8 @@ and provides panel-quadrature heuristics for the Heston measure.
 from __future__ import annotations
 
 import numpy as np
+from scipy.integrate import quad
+from scipy.special import gamma
 
 
 # ---------------------------------------------------------------------------
@@ -16,24 +18,56 @@ _MEASURE_PANEL_TEMPLATE = np.array([
     0.0, 3.0, 7.0, 12.0, 20.0, 35.0,
     55.0, 80.0, 110.0, 150.0, 200.0,
     270.0, 350.0, 500.0, 700.0, 1000.0,
-    1400.0, 2000.0,
+    1400.0, 2000.0, 2800.0, 4000.0, 5600.0,
+    8000.0, 11000.0, 16000.0, 22000.0, 32000.0,
+    45000.0, 64000.0, 90000.0, 128000.0, 180000.0,
+    256000.0,
 ])
 
-
-def _round_up_to_grid(
-    x: float,
-    grid=(150.0, 250.0, 350.0, 500.0, 700.0, 1000.0),
-) -> float:
-    for g in grid:
-        if x <= g:
-            return float(g)
-    return float(grid[-1])
+# |phi| at the heuristic cutoff L.
+_MEASURE_L_EPS = 1e-10
 
 
-def _heuristic_measure_L(T: float, kmax: float) -> float:
-    T_eff = max(float(T), 1e-4)
-    raw = 160.0 * (1.0 + 0.75 * float(kmax)) / np.sqrt(T_eff)
-    return _round_up_to_grid(raw)
+def _heuristic_measure_L(T: float, param, H_values) -> float:
+    """Fourier cutoff where |phi| has decayed to about ``_MEASURE_L_EPS`` for every H.
+
+    For large u the Riccati solution sits at its stable root, Re h ~ -u sqrt(1 - rho^2)/nu,
+    so log|phi(u)| ~ -c u with c = sqrt(1 - rho^2)/nu * (V0 T^(1-a)/Gamma(2-a) + theta T)
+    and a = H + 1/2.  For small u the decay is Gaussian, log|phi(u)| ~ -u^2/2 int_0^T xi,
+    with the forward variance xi bounded from below by _integrated_variance_lower.  L is the
+    larger of the two points where these reach log(eps), rounded up to a panel-template
+    endpoint and capped at the last one.
+    """
+    log_eps = -np.log(_MEASURE_L_EPS)
+    L = 0.0
+    with np.errstate(divide="ignore"):
+        for H in np.atleast_1d(H_values):
+            a = float(H) + 0.5
+            c = np.sqrt(1.0 - param.rho ** 2) / param.nu * (
+                param.V0 * T ** (1.0 - a) / gamma(2.0 - a) + param.theta * T)
+            L = max(L, log_eps / c, np.sqrt(2.0 * log_eps / _integrated_variance_lower(T, param, a)))
+    idx = min(int(np.searchsorted(_MEASURE_PANEL_TEMPLATE, L)), len(_MEASURE_PANEL_TEMPLATE) - 1)
+    return float(_MEASURE_PANEL_TEMPLATE[idx])
+
+
+def _integrated_variance_lower(T: float, param, a: float) -> float:
+    """Lower bound of int_0^T xi, the forward variance xi(t) = E[V_t].
+
+    xi = theta/lam + (V0 - theta/lam) E_a(-lam t^a) moves monotonically from V0 towards
+    theta/lam.  With y = t^a/Gamma(1 + a), two bounds on the Mittag-Leffler function give a
+    lower bound either way.  Rising, E_a(-x) <= 1/(1 + x/Gamma(1 + a)) (T. Simon, 2015) gives
+    xi(t) >= (V0 + theta y) / (1 + lam y): exact at lam = 0, and positive at V0 = 0.  Falling,
+    E_a(-x) is completely monotone, hence log-convex, and so lies above its tangent in log
+    scale, exp(-x/Gamma(1 + a)): xi(t) >= theta/lam + (V0 - theta/lam) exp(-lam y), exact at
+    a = 1, and positive at theta = 0.
+    """
+    y = lambda t: t ** a / gamma(1.0 + a)
+    if param.theta < param.lam * param.V0:
+        m = param.theta / param.lam
+        xi = lambda t: m + (param.V0 - m) * np.exp(-param.lam * y(t))
+    else:
+        xi = lambda t: (param.V0 + param.theta * y(t)) / (1.0 + param.lam * y(t))
+    return quad(xi, 0.0, T)[0]
 
 
 def _heuristic_measure_panels(L: float) -> np.ndarray:
@@ -69,22 +103,21 @@ def _as_strict_panels(panels, L=None) -> np.ndarray:
 
 def _nested_measure_L_candidates(
     T: float,
-    kmax: float,
+    param,
+    H_values,
     *,
-    include_heuristic: bool = True,
     max_L: float | None = None,
 ) -> list[float]:
     """Return L candidates that are exactly _MEASURE_PANEL_TEMPLATE endpoints and nested.
 
-    Starting from the first template endpoint >= min(L0, 100) where L0 is the
-    heuristic cutoff, returns all remaining template endpoints up to max_L.
+    Starting from the heuristic cutoff L0 (itself a template endpoint), returns
+    all remaining template endpoints up to max_L.
     Because candidates are exact template endpoints, _heuristic_measure_panels
     produces genuinely nested grids as L increases.
     """
-    L0 = _heuristic_measure_L(T, kmax)
+    L0 = _heuristic_measure_L(T, param, H_values)
     endpoints = _MEASURE_PANEL_TEMPLATE[_MEASURE_PANEL_TEMPLATE > 0.0]
-    min_start = min(float(L0), 100.0)
-    idx_start = int(np.searchsorted(endpoints, min_start, side='left'))
+    idx_start = int(np.searchsorted(endpoints, L0, side='left'))
     candidates = endpoints[idx_start:]
     if max_L is not None:
         candidates = candidates[candidates <= float(max_L)]
