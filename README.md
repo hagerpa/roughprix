@@ -1,5 +1,7 @@
 # roughprix: option pricing in the rough Heston model
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24191763.svg)](https://doi.org/10.5281/zenodo.24191763)
+
 European option pricing for rough stochastic volatility models via Fourier inversion. The current implementation focuses on the **rough Heston model**; further models will follow.
 
 Pricing rests on the log-price characteristic function, which is expressed through a Riccati-type Volterra equation. `roughprix` provides several methods for solving that equation, ranging from direct numerical Volterra solvers to analytic approximations, and adds a **Taylor expansion in the Hurst exponent** $H$ (Hager & Kreher 2026, [arXiv:2606.16619](https://arxiv.org/abs/2606.16619)) that makes evaluating the characteristic function across a range of roughness values nearly free once the anchor solve is done. The numerical solvers are implemented in **JAX** for JIT-compiled execution.
