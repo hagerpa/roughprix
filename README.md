@@ -2,10 +2,14 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24191763.svg)](https://doi.org/10.5281/zenodo.24191763)
 
+Documentation: <https://hagerpa.github.io/roughprix/>
+
+<!-- --8<-- [start:intro] -->
 European option pricing for rough stochastic volatility models via Fourier inversion. The current implementation focuses on the **rough Heston model**; further models will follow.
 
 Pricing rests on the log-price characteristic function, which is expressed through a Riccati-type Volterra equation. `roughprix` provides several methods for solving that equation, ranging from direct numerical Volterra solvers to analytic approximations, and adds a **Taylor expansion in the Hurst exponent** $H$ (Hager & Kreher 2026, [arXiv:2606.16619](https://arxiv.org/abs/2606.16619)) that makes evaluating the characteristic function across a range of roughness values nearly free once the anchor solve is done. The numerical solvers are implemented in **JAX** for JIT-compiled execution.
 
+<!-- --8<-- [start:methods] -->
 ### Methods implemented
 
 | Method | `base_solution` | Description |
@@ -17,7 +21,10 @@ Pricing rests on the log-price characteristic function, which is expressed throu
 | $H$-expansion | any base | Taylor series $\sum_{n=0}^{N} \frac{(\Delta H)^n}{n!} f_n$ around an anchor $H_0$; coefficients $f_n$ obtained by recursive differentiation of the Riccati equation |
 
 With `base_solution="direct_riccati"`, the default `direct_riccati_solver="auto"` uses implicit-$\pi$. Adams is opt-in via `direct_riccati_solver="adams"` and requires a uniform time grid (`time_grid="uniform"`; the default is `"graded"`); it can return NaN for $H \le 0$ or on coarse grids.
+<!-- --8<-- [end:methods] -->
+<!-- --8<-- [end:intro] -->
 
+<!-- --8<-- [start:install] -->
 ## Installation
 
 ```bash
@@ -27,7 +34,9 @@ pip install roughprix
 or, from a clone of the repository, `pip install -e .`.
 
 Requires Python ≥ 3.10, NumPy, SciPy, JAX, and Numba.
+<!-- --8<-- [end:install] -->
 
+<!-- --8<-- [start:model] -->
 ## Model
 
 The spot $S$ and instantaneous variance $V$ satisfy
@@ -48,7 +57,9 @@ $$
 where $H \in (-\tfrac{1}{2}, \tfrac{1}{2}]$ is the Hurst exponent. $H = \tfrac{1}{2}$ recovers classical Heston.
 
 The coefficients are raw: $\theta$ is the drift constant, and the long-run variance is $\theta/\lambda$. For the usual form $\kappa(\bar v - V_s)$, set $\lambda = \kappa$ and $\theta = \kappa \bar v$.
+<!-- --8<-- [end:model] -->
 
+<!-- --8<-- [start:quickstart] -->
 ## Quick start
 
 ```python
@@ -69,8 +80,10 @@ model = RoughHeston(param, riskfree=0.0)
 K = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
 T = 1.0
 ```
+<!-- --8<-- [end:quickstart] -->
 
 ## Pricing
+<!-- --8<-- [start:pricing] -->
 
 The characteristic function is evaluated numerically at `param.H` and inverted via Fourier quadrature. The `base_solution` constructor argument selects the Riccati solver:
 
@@ -120,8 +133,10 @@ ivs = model.eur_call_put(
     adaptive_verbose=True,
 )
 ```
+<!-- --8<-- [end:pricing] -->
 
 ## Pricing with the H-expansion
+<!-- --8<-- [start:expansion] -->
 
 The H-expansion approximates the log characteristic function as a Taylor series in $\Delta H = H - H_0$ around an anchor $H_0$:
 
@@ -229,8 +244,10 @@ The error depends on $|\Delta H|$, the maturity, how far out of the money the st
 - **Padé bases** away from $H_0 = \tfrac12$: it compares the two `log_cf_integrand` formulas at the anchor. Both are exact for the exact Riccati solution, and `"rhs"` amplifies the error of an approximate one, so they differ by about the error of `"rhs"`. With `"root_pade"` the default `"solution"` is 3–10 times more accurate than that difference, so there the check uses a third of it. On 756 root-Padé smiles it warned on 25 of the 26 above 1 bp (it missed one at 1.4 bp) and on 11 of the 730 below.
 
 The check adds about 10–35 % run time. `accuracy_check=False` turns it off.
+<!-- --8<-- [end:expansion] -->
 
 ## API reference
+<!-- --8<-- [start:api] -->
 
 ### `RoughHestonParam`
 
@@ -272,12 +289,14 @@ The check adds about 10–35 % run time. `accuracy_check=False` turns it off.
 | `integration` | `"panel"` | `"panel"` (fixed $L$) or `"adaptive_panel"` (auto-select $L$; warns when no two successive $L$ agree) |
 | `time_steps` | `400` | Time-grid nodes for the expansion Volterra solve |
 | `time_grid` | `"graded"` | `"graded"` clusters nodes near $t = 0$, where the solution is rough; `"uniform"` or `"symmetric_graded"`. Adams needs `"uniform"` |
-| `R` | `0.5` | Fourier contour height. $R = 0.5$ prices every strike as a call and gets puts by parity (the Lewis contour for vanillas); it needs only $E[S_T^{1/2}]$, which is always finite. Other values use damped contours at $\pm |R|$, which need $E[S_T^{\pm |R|}] < \infty$. Below $|R| = 1$ vanilla calls get the residue $S_0$ of the payoff's pole at 1 added, as in the Lewis formula (half of it at 1); $R = 0$ runs through the pole at 0 and adds half of its residue. Near a pole the integrand has a peak of width $\lvert R - \text{pole}\rvert$ at $u = 0$: $10^{-2}$ from a pole prices are off by $4 \cdot 10^{-9}$, $10^{-3}$ from it by up to $2 \cdot 10^{-3} S_0$ |
+| `R` | `0.5` | Fourier contour height. $R = 0.5$ prices every strike as a call and gets puts by parity (the Lewis contour for vanillas); it needs only $E[S_T^{1/2}]$, which is always finite. Other values use damped contours at $\pm \lvert R\rvert$, which need $E[S_T^{\pm \lvert R\rvert}] < \infty$. Below $\lvert R\rvert = 1$ vanilla calls get the residue $S_0$ of the payoff's pole at 1 added, as in the Lewis formula (half of it at 1); $R = 0$ runs through the pole at 0 and adds half of its residue. Near a pole the integrand has a peak of width $\lvert R - \text{pole}\rvert$ at $u = 0$: $10^{-2}$ from a pole prices are off by $4 \cdot 10^{-9}$, $10^{-3}$ from it by up to $2 \cdot 10^{-3} S_0$ |
 | `m_cheb` | `16` | Chebyshev nodes per Fourier panel |
 | `adaptive_tol` | `1e-4` | Max implied-vol change threshold for adaptive convergence (digitals compare prices instead) |
 | `accuracy_check` | `True` | Estimate the error of the H-expansion and of the Padé bases and warn when it exceeds `accuracy_tol`; see [Accuracy](#accuracy) |
 | `accuracy_tol` | `1e-4` | Warning threshold of the check, in implied vol (1 bp) |
+<!-- --8<-- [end:api] -->
 
+<!-- --8<-- [start:roadmap] -->
 ## Roadmap
 
 The following extensions are planned:
@@ -286,8 +305,10 @@ The following extensions are planned:
 - **Path-dependent options** — barriers, Asians, and lookbacks.
 - **Rough Bergomi model.**
 - **American options.**
+<!-- --8<-- [end:roadmap] -->
 
 ## Reproducing the paper
+<!-- --8<-- [start:paper] -->
 
 The numerical results in Section 4 of Hager & Kreher (2026, [arXiv:2606.16619v1](https://arxiv.org/abs/2606.16619v1)) were computed with the code as of June 2026. Version 0.1.0 corrects several errors of that code and changes its defaults (see the [changelog](https://github.com/hagerpa/roughprix/blob/main/CHANGELOG.md)). One of these corrections changes published numbers. Around $H_0 = \tfrac12$ the linearised equations of the expansion have an exponential kernel, which 0.1.0 integrates exactly; the earlier code used the trapezoidal rule. This moves the smiles of Figure 2 with $N \ge 1$ by up to $1.4 \cdot 10^{-5}$ in implied volatility, and it changes Table 1 at $(H, T, N) = (0.2, 0.019, 4)$ from 0.3965 to 0.3966.
 
@@ -348,8 +369,10 @@ for H0 in (0.0, 0.5):
 With commit `320dfd9` these calls reproduce all 64 table entries in all printed digits. They reproduce the smiles of Figures 2 and 3 to $10^{-8}$ in implied volatility, the precision of the published figures, and the data of Figure 1 to $10^{-14}$.
 
 With version 0.1.0, add `log_cf_integrand="rhs"` to each `RoughHeston(...)`. Otherwise 0.1.0 uses another formula for the log characteristic function at anchors $H_0 \neq \tfrac12$, which includes the benchmark. The results then agree with the published numbers to the same precision, apart from the correction above. In 0.1.0 many of these calls warn, either from the accuracy check or because the cutoff reaches 1000 without meeting `adaptive_tol` (mostly at $T \le 0.083$). The warnings do not change the values.
+<!-- --8<-- [end:paper] -->
 
 ## Citation
+<!-- --8<-- [start:citation] -->
 
 If you use `roughprix` in your research, please cite the paper
 
@@ -374,3 +397,4 @@ To cite the software itself, use [`CITATION.cff`](https://github.com/hagerpa/rou
 - Gatheral, J. & Radoičić, R. (2019). *Rational approximation of the rough Heston solution.* International Journal of Theoretical and Applied Finance, 22(3), 1950010. [doi:10.1142/S0219024919500109](https://doi.org/10.1142/S0219024919500109)
 - Gatheral, J. & Radoičić, R. (2024). *A generalization of the rational rough Heston approximation.* Quantitative Finance, 24(2), 329–335. [doi:10.1080/14697688.2024.2302055](https://doi.org/10.1080/14697688.2024.2302055)
 - Hager, P. P. & Kreher, D. (2026). *Expanding the rough Heston model in $H$.* Preprint. [arXiv:2606.16619](https://arxiv.org/abs/2606.16619)
+<!-- --8<-- [end:citation] -->

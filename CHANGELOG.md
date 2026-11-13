@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Documentation site, https://hagerpa.github.io/roughprix/: guides, API reference, and accuracy and speed against the reference smiles.
+- README: the Zenodo DOI; the description of `R` in the `eur_call_put` table is shown in full on GitHub and PyPI.
+
 ## 0.1.0
 
 First release on PyPI. Most default prices change. The test suite holds 72 reference smiles from a separate pricer that shares no code with the package (implicit product integration with 2000 steps and the Lewis formula; $H$ from $-0.4$ to $\tfrac12$, one week to five years, strikes out to three standard deviations). Where their out-of-the-money prices are at least $10^{-6} S_0$, implied vols at the 0.0.1 default settings are off by more than 1 bp in 39 smiles and by more than 100 bp, or NaN, in 10; at the 0.1.0 defaults by at most 0.003 bp.

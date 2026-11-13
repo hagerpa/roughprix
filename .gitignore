@@ -33,3 +33,9 @@ htmlcov/
 
 # Data files (large benchmark outputs)
 notebooks/data/
+
+# MkDocs build output
+site/
+
+# MkDocs privacy plugin cache
+.cache/

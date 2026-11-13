@@ -32,6 +32,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/hagerpa/roughprix"
+Documentation = "https://hagerpa.github.io/roughprix/"
 Repository = "https://github.com/hagerpa/roughprix"
 Changelog = "https://github.com/hagerpa/roughprix/blob/main/CHANGELOG.md"
 

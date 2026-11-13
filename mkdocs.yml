@@ -1,0 +1,125 @@
+site_name: roughprix
+site_description: Option pricing in the rough Heston model, with a Taylor expansion in the Hurst exponent H
+site_url: https://hagerpa.github.io/roughprix/
+repo_url: https://github.com/hagerpa/roughprix
+repo_name: hagerpa/roughprix
+edit_uri: ""
+copyright: Copyright 2026 Paul P. Hager · Apache License 2.0
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  font:
+    text: Inter
+    code: Fira Code
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.footer
+    - navigation.instant
+    - toc.follow
+    - toc.integrate
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/hagerpa/roughprix
+      name: GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/roughprix/
+      name: PyPI
+    - icon: simple/arxiv
+      link: https://arxiv.org/abs/2606.16619
+      name: Paper on arXiv
+    - icon: simple/zenodo
+      link: https://doi.org/10.5281/zenodo.24191763
+      name: Zenodo
+
+nav:
+  - Home: index.md
+  - Pricing: pricing.md
+  - H-expansion: expansion.md
+  - Accuracy and speed: benchmarks.md
+  - API reference: api.md
+  - Reproducing the paper: paper.md
+  - Citation: citation.md
+
+markdown_extensions:
+  - tables
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js
+
+hooks:
+  - docs/hooks.py
+
+plugins:
+  - search
+  - privacy:
+      assets_exclude:
+        - zenodo.org/*
+        - img.shields.io/*
+        - cdn.jsdelivr.net/*
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+            heading_level: 3
+
+exclude_docs: |
+  /scripts/
+  /generated/
+  /hooks.py
+  /requirements.txt
+  /overrides/
+  __pycache__/
+
+validation:
+  links:
+    anchors: warn

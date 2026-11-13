@@ -1,0 +1,9 @@
+.rp-hero { padding: 2.2rem 1.6rem 1.6rem; margin: 0 0 1.6rem; border-radius: .6rem;
+  background: linear-gradient(135deg, #4527a0 0%, #7e57c2 60%, #b388ff 100%); color: #fff; }
+.rp-hero h1 { color: #fff; margin: 0 0 .4rem; font-weight: 700; font-size: 2.4rem; }
+.rp-hero p { font-size: 1.05rem; max-width: 40rem; }
+.rp-hero .md-button { color: #fff; border-color: #fff; }
+.rp-hero .md-button--primary { background: #ffc400; border-color: #ffc400; color: #311b92; }
+
+.md-typeset table:not([class]) code { white-space: nowrap; }
+.md-typeset .grid.cards { grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); }
