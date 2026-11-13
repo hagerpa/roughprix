@@ -6,7 +6,13 @@ hide:
 
 <div class="rp-hero" markdown>
 
+<div class="rp-title" markdown>
+
+![roughprix logo](assets/logo.svg){ .rp-logo }
+
 # roughprix
+
+</div>
 
 European option prices in the rough Heston model, by Fourier inversion, with a Taylor expansion in the Hurst exponent $H$.
 
