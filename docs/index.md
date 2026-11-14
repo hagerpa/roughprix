@@ -28,7 +28,7 @@ European option prices in the rough Heston model, by Fourier inversion, with a T
 
     ---
 
-    A smile of nine strikes in about 40 to 90 ms, with JAX-compiled Riccati solvers.
+    A smile of nine strikes in about 40 to 80 ms, with JAX-compiled Riccati solvers.
 
 -   :material-sigma:{ .lg .middle } __Expansion in $H$__
 
