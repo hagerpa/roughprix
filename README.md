@@ -310,7 +310,7 @@ The following extensions are planned:
 ## Reproducing the paper
 <!-- --8<-- [start:paper] -->
 
-The numerical results in Section 4 of Hager & Kreher (2026, [arXiv:2606.16619v1](https://arxiv.org/abs/2606.16619v1)) were computed with the code as of June 2026. Version 0.1.0 corrects several errors of that code and changes its defaults (see the [changelog](https://github.com/hagerpa/roughprix/blob/main/CHANGELOG.md)). One of these corrections changes published numbers. Around $H_0 = \tfrac12$ the linearised equations of the expansion have an exponential kernel, which 0.1.0 integrates exactly; the earlier code used the trapezoidal rule. This moves the smiles of Figure 2 with $N \ge 1$ by up to $1.4 \cdot 10^{-5}$ in implied volatility, and it changes Table 1 at $(H, T, N) = (0.2, 0.019, 4)$ from 0.3965 to 0.3966.
+The numerical results in Section 4 of Hager & Kreher (2026, [arXiv:2606.16619v1](https://arxiv.org/abs/2606.16619v1)) were computed with the code as of June 2026. Version 0.1.0 refines that code and changes its defaults (see the [changelog](https://github.com/hagerpa/roughprix/blob/main/CHANGELOG.md)). Only one of these changes affects the published numbers, and only slightly. Around $H_0 = \tfrac12$ the linearised equations of the expansion have an exponential kernel, which 0.1.0 integrates exactly; the earlier code used the trapezoidal rule. This moves the smiles of Figure 2 with $N \ge 1$ by up to $1.4 \cdot 10^{-5}$ in implied volatility, and it changes Table 1 at $(H, T, N) = (0.2, 0.019, 4)$ from 0.3965 to 0.3966.
 
 To reproduce the published numbers exactly, install commit [`320dfd9`](https://github.com/hagerpa/roughprix/tree/320dfd9792f8f2b32a1e85ef66309440e37a7f35) in a separate environment. It is version 0.0.1 with its import error fixed.
 
@@ -368,7 +368,7 @@ for H0 in (0.0, 0.5):
 
 With commit `320dfd9` these calls reproduce all 64 table entries in all printed digits. They reproduce the smiles of Figures 2 and 3 to $10^{-8}$ in implied volatility, the precision of the published figures, and the data of Figure 1 to $10^{-14}$.
 
-With version 0.1.0, add `log_cf_integrand="rhs"` to each `RoughHeston(...)`. Otherwise 0.1.0 uses another formula for the log characteristic function at anchors $H_0 \neq \tfrac12$, which includes the benchmark. The results then agree with the published numbers to the same precision, apart from the correction above. In 0.1.0 many of these calls warn, either from the accuracy check or because the cutoff reaches 1000 without meeting `adaptive_tol` (mostly at $T \le 0.083$). The warnings do not change the values.
+With version 0.1.0, add `log_cf_integrand="rhs"` to each `RoughHeston(...)`. Otherwise 0.1.0 uses another formula for the log characteristic function at anchors $H_0 \neq \tfrac12$, which includes the benchmark. The results then agree with the published numbers to the same precision, apart from the change above. In 0.1.0 many of these calls warn, either from the accuracy check or because the cutoff reaches 1000 without meeting `adaptive_tol` (mostly at $T \le 0.083$). The warnings do not change the values.
 <!-- --8<-- [end:paper] -->
 
 ## Citation
