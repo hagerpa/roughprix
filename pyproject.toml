@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roughprix"
-version = "0.1.0"
+version = "0.1.1"
 description = "European option pricing for the rough Heston model with H-expansion"
 readme = "README.md"
 license = "Apache-2.0"

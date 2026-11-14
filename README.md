@@ -368,7 +368,7 @@ for H0 in (0.0, 0.5):
 
 With commit `320dfd9` these calls reproduce all 64 table entries in all printed digits. They reproduce the smiles of Figures 2 and 3 to $10^{-8}$ in implied volatility, the precision of the published figures, and the data of Figure 1 to $10^{-14}$.
 
-With version 0.1.0, add `log_cf_integrand="rhs"` to each `RoughHeston(...)`. Otherwise 0.1.0 uses another formula for the log characteristic function at anchors $H_0 \neq \tfrac12$, which includes the benchmark. The results then agree with the published numbers to the same precision, apart from the change above. In 0.1.0 many of these calls warn, either from the accuracy check or because the cutoff reaches 1000 without meeting `adaptive_tol` (mostly at $T \le 0.083$). The warnings do not change the values.
+With version 0.1.0 or later, add `log_cf_integrand="rhs"` to each `RoughHeston(...)`. Otherwise roughprix uses another formula for the log characteristic function at anchors $H_0 \neq \tfrac12$, which includes the benchmark. The results then agree with the published numbers to the same precision, apart from the change above. Many of these calls then warn, either from the accuracy check or because the cutoff reaches 1000 without meeting `adaptive_tol` (mostly at $T \le 0.083$). The warnings do not change the values.
 <!-- --8<-- [end:paper] -->
 
 ## Citation

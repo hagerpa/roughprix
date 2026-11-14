@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
-- Documentation site, https://hagerpa.github.io/roughprix/: guides, API reference, and accuracy and speed against the reference smiles.
-- README: the Zenodo DOI; the description of `R` in the `eur_call_put` table is shown in full on GitHub and PyPI.
+Documentation only; the code and its results are the same as in 0.1.0.
+
+- Documentation site, https://hagerpa.github.io/roughprix/: guides, API reference, and accuracy and speed against the reference smiles. PyPI links to it.
+- README: the links to the documentation and the Zenodo DOI; the description of `R` in the `eur_call_put` table is shown in full on GitHub and PyPI; plainer wording in "Reproducing the paper".
 
 ## 0.1.0
 

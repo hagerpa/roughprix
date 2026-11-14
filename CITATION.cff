@@ -9,7 +9,7 @@ authors:
   - family-names: Hager
     given-names: Paul P.
     affiliation: University of Vienna
-version: 0.1.0
+version: 0.1.1
 doi: 10.5281/zenodo.24191763
 license: Apache-2.0
 repository-code: "https://github.com/hagerpa/roughprix"
